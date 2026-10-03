@@ -1,0 +1,15 @@
+{
+  "mcp": {
+    "code-intelligence": {
+      "type": "local",
+      "command": ["code-intelligence", "serve-mcp"],
+      "enabled": true,
+      "environment": {
+        "CODE_INTELLIGENCE_CONFIG": "/Users/you/.config/code-intelligence/config.toml",
+        "CODE_INTELLIGENCE_WORKSPACE": "your-workspace-id",
+        "GRAPHIFY_QUERY_LOG_DISABLE": "1",
+        "SERENA_USAGE_REPORTING": "false"
+      }
+    }
+  }
+}
