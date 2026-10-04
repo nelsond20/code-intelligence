@@ -15,7 +15,7 @@ export const configSchema = z.object({
   schema_version: z.literal(1).default(1),
   privacy: z.object({
     network_policy: z.enum(["loopback-only", "unrestricted"]).default("loopback-only"),
-    store_raw_source: z.boolean().default(false),
+    store_raw_source: z.literal(false).default(false),
     telemetry: z.literal(false).default(false),
     analytics: z.literal(false).default(false),
     query_logging: z.literal(false).default(false),

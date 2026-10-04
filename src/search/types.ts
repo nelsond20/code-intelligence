@@ -15,5 +15,6 @@ export interface SearchResponse {
   results: SearchResult[];
   mode: "lexical" | "semantic" | "auto";
   degraded?: string;
+  diagnostics?: Record<string, unknown>;
   truncated: boolean;
 }

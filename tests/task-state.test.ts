@@ -12,7 +12,8 @@ test("memory lifecycle, semantic notes, legacy migration, spec, and bounded comp
     const storage = new TaskStorage(path.join(env.data, "workspaces")); const service = new TaskService(storage);
     const first = await service.create("planning", "Duration fix", { objective: "Correct duration" });
     await service.note("planning", { type: "hypothesis", text: "Rounding is wrong", confidence: "medium", repo: "backend", file: "src/PlanningService.ts", symbol: "PlanningService.calculateDuration" });
-    await service.note("planning", { type: "evidence", text: "The service uses Math.round" });
+    await service.recordInspection("planning", { ref: "code://backend/src/PlanningService.ts#L=1-3", repo: "backend", files: ["src/PlanningService.ts"] });
+    await service.note("planning", { type: "evidence", text: "The service uses Math.round", evidence_refs: ["code://backend/src/PlanningService.ts#L=1-3"] });
     await service.update("planning", undefined, { phase: "design", spec: "Duration uses exact millisecond arithmetic." });
     const statePath = storage.statePath("planning", first.id);
     const legacy = JSON.parse(await readFile(statePath, "utf8"));
@@ -22,7 +23,7 @@ test("memory lifecycle, semantic notes, legacy migration, spec, and bounded comp
     const current = await restarted.current("planning");
     assert.equal(current?.id, first.id); assert.equal(current?.active_hypotheses.length, 1); assert.equal(current?.confirmed_findings.length, 1);
     assert.equal(Object.hasOwn(current || {}, "current_focus"), false); assert.equal(Object.hasOwn(current || {}, "next_actions"), false);
-    assert.equal((await restarted.storage.readSpec("planning", first.id)).trim(), "Duration uses exact millisecond arithmetic.");
+    assert.match(await restarted.storage.readSpec("planning", first.id), /R1.*Duration uses exact millisecond arithmetic/);
     await restarted.recordInspection("planning", { ref: "git://backend/commit/abcdef1", repo: "backend", commit: "abcdef1", files: ["src/PlanningService.ts"], symbols: ["calculateDuration"] });
     const recorded = await restarted.current("planning");
     assert.deepEqual(recorded?.inspected_commits, [{ repo: "backend", commit: "abcdef1" }]);

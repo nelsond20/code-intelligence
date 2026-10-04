@@ -18,13 +18,16 @@ test("public MCP exposes exactly context, memory, and plan", () => {
 test("public MCP schemas never expose workspace selection", () => {
   assert.deepEqual(Object.keys(contextFindInput.shape).sort(), ["limit", "query", "scope", "sources"]);
   assert.deepEqual(Object.keys(contextInspectInput.shape).sort(), ["ref", "view"]);
-  assert.equal(Object.hasOwn(memoryInput.shape, "workspace"), false);
-  assert.equal(Object.hasOwn(memoryInput.shape, "current_focus"), false);
-  assert.equal(Object.hasOwn(memoryInput.shape, "next_actions"), false);
+  for (const option of memoryInput.options) {
+    assert.equal(Object.hasOwn(option.shape, "workspace"), false);
+    assert.equal(Object.hasOwn(option.shape, "current_focus"), false);
+    assert.equal(Object.hasOwn(option.shape, "next_actions"), false);
+  }
   for (const option of planInput.options) assert.equal(Object.hasOwn(option.shape, "workspace"), false);
-  assert.deepEqual(planInput.options.map((option) => option.shape.action.value), ["create", "current", "complete", "revise"]);
+  assert.deepEqual(planInput.options.map((option) => option.shape.action.value), ["create", "current", "complete", "revise", "suspend", "reactivate", "abandon"]);
   assert.deepEqual(planInput.options.map((option) => Object.keys(option.shape).sort()), [
-    ["action", "steps"], ["action"], ["action"], ["action", "current_step", "future_steps", "reason"],
+    ["action", "exceptions", "steps"], ["action"], ["action"], ["action", "operations", "reason"],
+    ["action", "reason"], ["action"], ["action", "reason"],
   ]);
 });
 
@@ -40,7 +43,7 @@ test("MCP find and inspect use the configured workspace and record inspection th
     await runtime.contextInspect({ ref: found.results[0]!.ref, view: "content" });
     const current = await runtime.tasks.current("planning");
     assert.ok(current?.inspected_refs.includes(found.results[0]!.ref));
-    assert.ok(current?.relevant_files.some((file) => file.repo === "backend"));
+    assert.ok(current?.inspected_files.some((file) => file.repo === "backend"));
   } finally {
     if (original === undefined) delete process.env.CODE_INTELLIGENCE_WORKSPACE; else process.env.CODE_INTELLIGENCE_WORKSPACE = original;
     await env.cleanup();
@@ -58,7 +61,7 @@ test("all public memory actions use the configured workspace", async () => {
     assert.equal((await runtime.memory({ action: "note", type: "observation", text: "Configured workspace note" }) as { saved: boolean }).saved, true);
     assert.equal((await runtime.memory({ action: "pause" }) as { status: string }).status, "paused");
     assert.equal((await runtime.memory({ action: "activate", id: created.id }) as { status: string }).status, "active");
-    assert.equal((await runtime.memory({ action: "complete" }) as { status: string }).status, "completed");
+    assert.equal((await runtime.memory({ action: "complete", summary: "MCP memory action coverage completed." }) as { status: string }).status, "completed");
     const listed = await runtime.memory({ action: "list" }) as { memories: Array<{ id: string }> };
     assert.ok(listed.memories.some((memory) => memory.id === created.id));
   } finally {

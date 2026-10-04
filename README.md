@@ -152,7 +152,7 @@ For Ornith, use context `90112` and output `8192`. This project does not change 
 
 ## Typical workflow
 
-For substantial work, call `memory` with `action: "new"`, then use `context.find` and `context.inspect`. Record durable meaning—evidence, hypotheses, decisions, questions, and blockers—with `memory(action="note")`. Store confirmed outcome requirements in memory's spec. For guarded work, create a plan derived from that spec, call `plan(action="current")`, work only in the current step, verify it, and request `plan(action="complete")`. Use `plan(action="revise")` instead of silently deviating.
+For substantial work, call `memory` with `action: "new"`, then use `context.find` and `context.inspect`. Record durable meaning with `memory(action="note")` and resolve records by server ID. Manage structured requirements with `spec_replace`, `spec_patch`, or `spec_rollback`. For guarded work, create a coverage-checked plan, call `plan(action="current")`, work only in the current write set, verify it, and request `plan(action="complete")`. Use structured `plan(action="revise")` operations instead of silently deviating; suspend/reactivate/abandon are explicit lifecycle transitions.
 
 Memory lifecycle from the CLI:
 
@@ -165,7 +165,7 @@ code-intelligence memory complete --workspace planning
 code-intelligence plan current --workspace planning
 ```
 
-Each work item stores `state.json`, `findings.md`, and `spec.md`, with optional execution state in `plan.json`. The old `task` CLI namespace remains a deprecated compatibility alias; there is no public MCP `task` tool.
+Each work item stores schema-v2 `state.json`, curated `findings.md`, structured `spec.json`, immutable spec revisions, a human `spec.md`, a transaction journal, and optional `plan.json`. The old `task` CLI namespace remains a deprecated compatibility alias; there is no public MCP `task` tool.
 
 ## Git behavior
 
@@ -187,9 +187,14 @@ npm test
 npm run typecheck
 npm run lint
 npm run build
+npm run benchmark:prepare
 ```
 
 Tests cover memory and plan restart, spec staleness, verification generations, PlanGuard interception, broker fail-open behavior, path/symlink boundaries, secret exclusion, Git safety, installer idempotence, privacy policy, and the exact four-tool MCP surface.
+
+The model benchmark is documented in [docs/BENCHMARK.md](docs/BENCHMARK.md).
+Preparation creates isolated local fixtures but never invokes a model; endpoint
+access must be authorized separately.
 
 ## Uninstall OpenCode integration
 

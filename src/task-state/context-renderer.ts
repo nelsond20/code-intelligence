@@ -26,22 +26,28 @@ export function taskBootstrap(state: TaskState, findingsPath: string, specPath: 
 export function renderTaskContext(state: TaskState, findingsPath: string, specPath: string, maxTokens = 3000): string {
   const maxChars = Math.max(400, maxTokens * 4);
   const bootstrap = taskBootstrap(state, findingsPath, specPath);
-  let text = [
-    "## MEMORY",
+  const required = ["## MEMORY",
     `Work: ${bootstrap.title} (${bootstrap.id}, ${bootstrap.status})`,
     `Objective: ${bootstrap.objective || "Not set"}`,
     `Phase: ${bootstrap.phase}`,
-    bootstrap.confirmed_findings.length ? `Confirmed findings:\n${bootstrap.confirmed_findings.map((v) => `- ${v}`).join("\n")}` : "",
-    bootstrap.active_hypotheses.length ? `Active hypotheses:\n${bootstrap.active_hypotheses.map((v) => `- [${v.confidence}] ${v.text}`).join("\n")}` : "",
-    bootstrap.open_questions.length ? `Open questions:\n${bootstrap.open_questions.map((v) => `- ${v}`).join("\n")}` : "",
-    bootstrap.blockers.length ? `Blockers:\n${bootstrap.blockers.map((v) => `- ${v}`).join("\n")}` : "",
-    bootstrap.relevant_files.length ? `Relevant files:\n${bootstrap.relevant_files.map((v) => `- ${v.repo}:${v.path}`).join("\n")}` : "",
-    bootstrap.relevant_symbols.length ? `Relevant symbols: ${bootstrap.relevant_symbols.join(", ")}` : "",
-    bootstrap.inspected_commits.length ? `Recently inspected commits: ${bootstrap.inspected_commits.map((v) => `${v.repo}:${v.commit}`).join(", ")}` : "",
-    bootstrap.inspected_refs.length ? `Recently inspected refs: ${bootstrap.inspected_refs.join(", ")}` : "",
     `Detailed findings: ${findingsPath}`,
     `Confirmed spec: ${specPath}`,
-  ].filter(Boolean).join("\n\n");
-  if (text.length > maxChars) text = `${text.slice(0, maxChars - 34)}\n… [memory context truncated]`;
-  return text;
+  ];
+  const optional = [
+    ...bootstrap.blockers.map((v) => `Blocker: ${v}`),
+    ...bootstrap.open_questions.map((v) => `Open question: ${v}`),
+    ...bootstrap.confirmed_findings.map((v) => `Confirmed: ${v}`),
+    ...bootstrap.active_hypotheses.map((v) => `Hypothesis [${v.confidence}]: ${v.text}`),
+    ...bootstrap.relevant_files.map((v) => `Relevant file: ${v.repo}:${v.path}`),
+    ...bootstrap.relevant_symbols.map((v) => `Relevant symbol: ${v}`),
+    ...bootstrap.inspected_commits.map((v) => `Inspected commit: ${v.repo}:${v.commit}`),
+    ...bootstrap.inspected_refs.map((v) => `Inspected ref: ${v}`),
+  ];
+  const sections = [...required]; let truncated = false;
+  for (const item of optional) {
+    if ([...sections, item].join("\n\n").length > maxChars - 40) { truncated = true; break; }
+    sections.push(item);
+  }
+  if (truncated) sections.push("… [additional memory items omitted]");
+  return sections.join("\n\n");
 }

@@ -27,7 +27,7 @@ test("exact reads reject traversal, secrets, and symlink escape", async () => {
     const outside = path.join(env.root, "outside.txt"); await writeFile(outside, "outside");
     const link = path.join(fixture("backend"), "escape-test-link"); await symlink(outside, link);
     try {
-      await assert.rejects(readCode({ id: "backend", path: fixture("backend") }, "../shared/src/duration.ts"), /escapes/);
+      await assert.rejects(readCode({ id: "backend", path: fixture("backend") }, "../shared/src/duration.ts"), /escapes|excluded/);
       await assert.rejects(readCode({ id: "backend", path: fixture("backend") }, ".env.secret"), /excluded/);
       await assert.rejects(readCode({ id: "backend", path: fixture("backend") }, "escape-test-link"), /Symlink escapes/);
     } finally { const { rm } = await import("node:fs/promises"); await rm(link, { force: true }); }
@@ -82,7 +82,10 @@ test("oversized llamacpp chunks split safely with stable metadata and incrementa
       <= config.embeddings.batch_max_tokens_estimate));
     assert.ok(requestInputs.length > 1, "aggregate batching must still run after chunk splitting");
 
-    const metadataFile = path.join(env.data, "indexes", repository.id, "semantic-metadata.jsonl");
+    const indexRoot = path.join(env.data, "indexes", "default", repository.id);
+    const [fingerprint] = await (await import("node:fs/promises")).readdir(indexRoot);
+    const manifest = JSON.parse(await readFile(path.join(indexRoot, fingerprint!, "current.json"), "utf8")) as { generation: string };
+    const metadataFile = path.join(indexRoot, fingerprint!, "generations", manifest.generation, "semantic-metadata.jsonl");
     const firstMetadata = (await readFile(metadataFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
       path: string; start_line: number; end_line: number; hash: string; chunk_id: string;
     });
@@ -93,8 +96,8 @@ test("oversized llamacpp chunks split safely with stable metadata and incrementa
       assert.equal(firstMetadata[index]!.start_line, firstMetadata[index - 1]!.end_line + 1);
     }
     const textsFromRanges = firstMetadata.map((item) => sourceLines.slice(item.start_line - 1, item.end_line).join("\n"));
-    assert.deepEqual(flattenedInputs, textsFromRanges, "embedding input order must follow source line order");
-    assert.deepEqual(firstMetadata.map((item) => item.hash), flattenedInputs.map(sourceHash));
+    assert.deepEqual(flattenedInputs.map((text) => text.split("\n\n").at(-1)), textsFromRanges, "embedding input order must follow source line order");
+    assert.deepEqual(firstMetadata.map((item) => item.hash), flattenedInputs.map((text) => sourceHash(text.split("\n\n").at(-1)!)));
     assert.ok(firstMetadata.every((item) => /^[a-f0-9]{64}$/.test(item.chunk_id)));
 
     const requestsAfterFirstRun = requestInputs.length;

@@ -1,5 +1,6 @@
 import path from "node:path";
 import { mkdir, readFile } from "node:fs/promises";
+import crypto from "node:crypto";
 import type { CodeIntelligenceConfig, Repository } from "../config/schema.js";
 import { assertEndpointAllowed } from "../privacy/network-policy.js";
 import { appPaths } from "../workspace/paths.js";
@@ -8,9 +9,12 @@ import { chunkSource } from "./chunker.js";
 import { readTextSource, sourceHash, walkSourceFiles } from "./files.js";
 import { embeddingChunkIdentity, estimateEmbeddingTokens, safeIndividualEmbeddingBudget, splitEmbeddingChunk } from "./embedding-inputs.js";
 import type { SearchResult } from "./types.js";
+import { RepositoryAccessPolicy } from "../privacy/repository-access.js";
+import { languageForPath, parseSymbols } from "../symbols/parser.js";
 
-interface VectorMetadata { repo: string; path: string; start_line: number; end_line: number; hash: string; chunk_id?: string; }
-interface StoredIndex { schema_version: 1; provider?: "ollama" | "llamacpp"; model: string; dimensions: number; vectors: number[][]; }
+interface VectorMetadata { repo: string; path: string; start_line: number; end_line: number; hash: string; file_hash?: string; chunk_id?: string; symbol?: string; }
+interface StoredIndex { schema_version: 2; provider?: "ollama" | "llamacpp"; model: string; dimensions: number; vectors: number[][]; }
+interface IndexManifest { schema_version: 2; workspace: string; repo: string; root_fingerprint: string; generation: string; provider: string; model: string; dimensions: number; vectors: number; created_at: string; }
 export type Embedder = (texts: string[]) => Promise<number[][]>;
 export type IndexProgress =
   | { phase: "scanning" }
@@ -45,11 +49,25 @@ function cosine(a: number[], b: number[]): number {
 }
 
 export class SemanticIndex {
-  constructor(private readonly config: CodeIntelligenceConfig, private readonly root = appPaths().indexDir, private readonly fetcher: typeof fetch = fetch) {}
+  constructor(private readonly config: CodeIntelligenceConfig, private readonly root = appPaths().indexDir, private readonly fetcher: typeof fetch = fetch,
+    private readonly workspaceId = "default") {}
 
-  private paths(repositoryId: string) {
-    const root = path.join(this.root, repositoryId);
-    return { root, metadata: path.join(root, "semantic-metadata.jsonl"), vectors: path.join(root, "semantic-vectors.bin") };
+  private paths(repository: Repository, generation?: string) {
+    const fingerprint = crypto.createHash("sha256").update(path.resolve(repository.path)).digest("hex").slice(0, 16);
+    const root = path.join(this.root, this.workspaceId, repository.id, fingerprint);
+    const generationRoot = generation ? path.join(root, "generations", generation) : undefined;
+    return { root, fingerprint, manifest: path.join(root, "current.json"),
+      metadata: generationRoot && path.join(generationRoot, "semantic-metadata.jsonl"),
+      vectors: generationRoot && path.join(generationRoot, "semantic-vectors.bin") };
+  }
+
+  private async manifest(repository: Repository): Promise<IndexManifest | undefined> {
+    const raw = await readTextIfExists(this.paths(repository).manifest);
+    if (!raw) return undefined;
+    const value = JSON.parse(raw) as IndexManifest;
+    if (value.schema_version !== 2 || value.workspace !== this.workspaceId || value.repo !== repository.id
+      || value.root_fingerprint !== this.paths(repository).fingerprint) throw new Error(`Semantic index identity mismatch for ${repository.id}`);
+    return value;
   }
 
   embedder(): Embedder {
@@ -100,10 +118,11 @@ export class SemanticIndex {
 
   async index(repository: Repository, force = false, customEmbedder?: Embedder, onProgress?: IndexProgressCallback): Promise<{ chunks: number; files: number; reused: number }> {
     onProgress?.({ phase: "scanning" });
-    const locations = this.paths(repository.id);
-    await mkdir(locations.root, { recursive: true, mode: 0o700 });
-    const previousMetadata = force ? [] : await this.readMetadata(repository.id);
-    const previousIndex = force ? undefined : await this.readVectors(repository.id);
+    const base = this.paths(repository);
+    const previousManifest = force ? undefined : await this.manifest(repository);
+    await mkdir(base.root, { recursive: true, mode: 0o700 });
+    const previousMetadata = force ? [] : await this.readMetadata(repository);
+    const previousIndex = force ? undefined : await this.readVectors(repository);
     const previousProvider = previousIndex?.provider || "ollama";
     const canReuse = previousIndex?.model === this.config.embeddings.model && previousProvider === this.config.embeddings.provider;
     const metadataKey = (meta: VectorMetadata) => meta.chunk_id || `${meta.path}:${meta.start_line}:${meta.end_line}:${meta.hash}`;
@@ -118,9 +137,10 @@ export class SemanticIndex {
       if (source === undefined) continue;
       const fileHash = sourceHash(source);
       const occurrences = new Map<string, number>();
-      for (const chunk of chunkSource(source)) {
+      const symbols = parseSymbols(source);
+      for (const chunk of chunkSource(source, 80, 12, symbols)) {
         const chunks = this.config.embeddings.provider === "llamacpp"
-          ? splitEmbeddingChunk(chunk, safeIndividualEmbeddingBudget(this.config.embeddings.batch_max_tokens_estimate))
+          ? splitEmbeddingChunk(chunk, Math.max(256, safeIndividualEmbeddingBudget(this.config.embeddings.batch_max_tokens_estimate) - 512))
           : [chunk];
         for (const embeddingChunk of chunks) {
           let item: VectorMetadata;
@@ -131,14 +151,18 @@ export class SemanticIndex {
             occurrences.set(occurrenceKey, occurrence + 1);
             const identity = embeddingChunkIdentity(relative, embeddingChunk, occurrence);
             item = { repo: repository.id, path: relative, start_line: embeddingChunk.start_line,
-              end_line: embeddingChunk.end_line, hash: identity.hash, chunk_id: identity.chunk_id };
+              end_line: embeddingChunk.end_line, hash: identity.hash, file_hash: fileHash, chunk_id: identity.chunk_id, symbol: embeddingChunk.symbol };
           } else {
             item = { repo: repository.id, path: relative, start_line: embeddingChunk.start_line,
-              end_line: embeddingChunk.end_line, hash: fileHash };
+              end_line: embeddingChunk.end_line, hash: fileHash, file_hash: fileHash, symbol: embeddingChunk.symbol };
           }
           const old = reusable.get(metadataKey(item));
           if (old) { metadata.push(item); vectors.push(old); reused++; }
-          else pending.push({ metadata: item, text: embeddingChunk.text });
+          else {
+            const header = [`repo: ${repository.id}`, `path: ${relative}`, `language: ${languageForPath(relative)}`,
+              embeddingChunk.symbol ? `symbol: ${embeddingChunk.symbol}` : "", embeddingChunk.signature ? `signature: ${embeddingChunk.signature}` : ""].filter(Boolean).join("\n");
+            pending.push({ metadata: item, text: `${header}\n\n${embeddingChunk.text}` });
+          }
         }
       }
     }
@@ -154,9 +178,16 @@ export class SemanticIndex {
         reused, files: files.length, elapsed_ms: performance.now() - startedAt });
     }
     const dimensions = vectors[0]?.length || 0;
-    await atomicWrite(locations.metadata, metadata.map((item) => JSON.stringify(item)).join("\n") + (metadata.length ? "\n" : ""));
-    await atomicWrite(locations.vectors, JSON.stringify({ schema_version: 1, provider: this.config.embeddings.provider,
+    if (vectors.some((vector) => vector.length !== dimensions)) throw new Error("Embedding provider returned inconsistent vector dimensions");
+    const generation = `${Date.now().toString(36)}-${crypto.randomBytes(6).toString("hex")}`;
+    const next = this.paths(repository, generation);
+    await mkdir(path.dirname(next.metadata!), { recursive: true, mode: 0o700 });
+    await atomicWrite(next.metadata!, metadata.map((item) => JSON.stringify(item)).join("\n") + (metadata.length ? "\n" : ""));
+    await atomicWrite(next.vectors!, JSON.stringify({ schema_version: 2, provider: this.config.embeddings.provider,
       model: this.config.embeddings.model, dimensions, vectors } satisfies StoredIndex));
+    await atomicWrite(base.manifest, `${JSON.stringify({ schema_version: 2, workspace: this.workspaceId, repo: repository.id,
+      root_fingerprint: base.fingerprint, generation, provider: this.config.embeddings.provider, model: this.config.embeddings.model,
+      dimensions, vectors: vectors.length, created_at: new Date().toISOString() } satisfies IndexManifest, null, 2)}\n`);
     onProgress?.({ phase: "complete", completed: pending.length, total: pending.length, reused,
       files: files.length, elapsed_ms: performance.now() - startedAt });
     return { chunks: metadata.length, files: files.length, reused };
@@ -167,29 +198,58 @@ export class SemanticIndex {
     if (!queryVector) throw new Error("Embedding provider returned no query vector");
     const scored: { metadata: VectorMetadata; score: number; repository: Repository }[] = [];
     for (const repository of repositories) {
-      const metadata = await this.readMetadata(repository.id);
-      const index = await this.readVectors(repository.id);
+      const metadata = await this.readMetadata(repository);
+      const index = await this.readVectors(repository);
       if (!index) continue;
+      if (metadata.length !== index.vectors.length || index.vectors.some((vector) => vector.length !== index.dimensions)) throw new Error(`Semantic index is inconsistent for ${repository.id}`);
       metadata.forEach((item, position) => scored.push({ metadata: item, score: cosine(queryVector, index.vectors[position] || []), repository }));
     }
     const output: SearchResult[] = [];
     for (const item of scored.sort((a, b) => b.score - a.score).slice(0, limit)) {
-      const source = await readFile(path.join(item.repository.path, item.metadata.path), "utf8");
+      const policy = await RepositoryAccessPolicy.create(item.repository.path);
+      if (!policy.canRead(item.metadata.path)) continue;
+      const resolved = await policy.resolveFile(item.metadata.path);
+      const source = await readFile(resolved.absolute, "utf8");
+      if (item.metadata.file_hash && sourceHash(source) !== item.metadata.file_hash) continue;
       const lines = source.split(/\r?\n/);
       output.push({ repo: item.metadata.repo, path: item.metadata.path, start_line: item.metadata.start_line, end_line: item.metadata.end_line,
         snippet: lines.slice(item.metadata.start_line - 1, Math.min(item.metadata.end_line, item.metadata.start_line + 12)).join("\n").slice(0, 1200),
-        reason: "semantic similarity", semantic_score: item.score, score: item.score });
+        reason: "semantic similarity", semantic_score: item.score, score: item.score, symbol: item.metadata.symbol });
     }
     return output;
   }
 
-  private async readMetadata(repositoryId: string): Promise<VectorMetadata[]> {
-    const raw = await readTextIfExists(this.paths(repositoryId).metadata);
-    if (!raw) return [];
-    return raw.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as VectorMetadata);
+  async status(repository: Repository): Promise<"fresh" | "partial" | "stale" | "missing"> {
+    const manifest = await this.manifest(repository);
+    if (!manifest) return "missing";
+    const metadata = await this.readMetadata(repository); let stale = 0;
+    const byFile = new Map<string, string>();
+    for (const item of metadata) if (item.file_hash) byFile.set(item.path, item.file_hash);
+    const policy = await RepositoryAccessPolicy.create(repository.path);
+    for (const [relative, hash] of byFile) {
+      try {
+        if (!policy.canRead(relative) || sourceHash(await readFile((await policy.resolveFile(relative)).absolute, "utf8")) !== hash) stale++;
+      } catch { stale++; }
+    }
+    return stale === 0 ? "fresh" : stale === byFile.size ? "stale" : "partial";
   }
-  private async readVectors(repositoryId: string): Promise<StoredIndex | undefined> {
-    const raw = await readTextIfExists(this.paths(repositoryId).vectors);
-    return raw ? JSON.parse(raw) as StoredIndex : undefined;
+
+  private async readMetadata(repository: Repository): Promise<VectorMetadata[]> {
+    const manifest = await this.manifest(repository); if (!manifest) return [];
+    const raw = await readTextIfExists(this.paths(repository, manifest.generation).metadata!);
+    if (!raw) return [];
+    return raw.trim().split(/\r?\n/).filter(Boolean).map((line) => {
+      const value = JSON.parse(line) as VectorMetadata;
+      if (!value.path || !Number.isInteger(value.start_line) || !Number.isInteger(value.end_line) || !value.hash) throw new Error("Invalid semantic metadata");
+      return value;
+    });
+  }
+  private async readVectors(repository: Repository): Promise<StoredIndex | undefined> {
+    const manifest = await this.manifest(repository); if (!manifest) return undefined;
+    const raw = await readTextIfExists(this.paths(repository, manifest.generation).vectors!);
+    if (!raw) return undefined;
+    const value = JSON.parse(raw) as StoredIndex;
+    if (value.schema_version !== 2 || !Array.isArray(value.vectors) || !Number.isInteger(value.dimensions)) throw new Error("Invalid semantic vector index");
+    return value;
   }
 }

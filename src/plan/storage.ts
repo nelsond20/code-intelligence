@@ -8,13 +8,16 @@ export class PlanStorage {
   path(workspaceId: string, memoryId: string): string { return this.tasks.planPath(workspaceId, memoryId); }
 
   async read(workspaceId: string, memoryId: string): Promise<PlanState | undefined> {
-    const raw = await readTextIfExists(this.path(workspaceId, memoryId));
+    const raw = await this.tasks.readPlan(workspaceId, memoryId);
     return raw === undefined ? undefined : planStateSchema.parse(JSON.parse(raw));
   }
 
   async write(workspaceId: string, plan: PlanState): Promise<void> {
     const parsed = planStateSchema.parse(plan);
-    await atomicWrite(this.path(workspaceId, plan.memory_id), `${JSON.stringify(parsed, null, 2)}\n`);
+    await this.tasks.transaction(workspaceId, plan.memory_id, "write-plan", async () => {
+      const target = this.path(workspaceId, plan.memory_id); const previous = await readTextIfExists(target);
+      if (previous !== undefined) await atomicWrite(`${target}.backup`, previous);
+      await atomicWrite(target, `${JSON.stringify(parsed, null, 2)}\n`);
+    });
   }
 }
-

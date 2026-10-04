@@ -110,6 +110,12 @@ export default {
 
   async setup(ctx) {
     try {
+      try {
+        const heartbeat = spawn("code-intelligence", ["integration", "heartbeat", "--workspace", "__CODE_INTELLIGENCE_WORKSPACE__"], {
+          cwd: ctx.location.directory, shell: false, stdio: "ignore", env: { ...process.env, NO_COLOR: "1" },
+        })
+        heartbeat.unref()
+      } catch { /* doctor will report a degraded guard */ }
       const registrations = []
       registrations.push(await ctx.session.hook("compaction", async (event) => {
         try {
@@ -141,7 +147,7 @@ export default {
         if (["edit", "write", "patch"].includes(event.tool)) {
           await runGuard(ctx.location.directory, "guard-after", { kind: "mutation", targets: mutationTargets(event) })
         } else if (event.tool === "execute" && Number.isInteger(exitCode(event))) {
-          await runGuard(ctx.location.directory, "guard-after", { kind: "verification", command: shellCommand(event), exit_code: exitCode(event) })
+          await runGuard(ctx.location.directory, "guard-after", { kind: "shell", command: shellCommand(event), exit_code: exitCode(event) })
         }
       }))
 

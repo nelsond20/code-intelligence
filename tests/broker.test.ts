@@ -52,7 +52,7 @@ test("context.inspect automatically records only mechanical inspection state", a
     const found = await runtime.contextFind({ query: "calculateDuration", sources: ["code"], limit: 2 });
     await runtime.contextInspect({ ref: found.results[0]!.ref, view: "content" });
     const current = await runtime.tasks.current("planning");
-    assert.ok(current?.inspected_refs.includes(found.results[0]!.ref)); assert.ok(current?.relevant_files.length);
+    assert.ok(current?.inspected_refs.includes(found.results[0]!.ref)); assert.ok(current?.inspected_files.length);
     assert.equal(current?.active_hypotheses.length, 0); assert.equal(current?.confirmed_findings.length, 0);
   } finally { await env.cleanup(); }
 });

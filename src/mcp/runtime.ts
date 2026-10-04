@@ -45,30 +45,49 @@ export class ToolRuntime {
   }
   async memory(input: MemoryInput) {
     const workspaceId = await this.workspaceId();
-    if (input.action === "current") return { ...(await this.tasks.bootstrap(workspaceId)), active_plan: await this.plans.current(workspaceId) };
     const summary = (state: { id: string; title: string; status: string; phase: string; objective: string; updated_at: string }) =>
       ({ id: state.id, title: state.title, status: state.status, phase: state.phase, objective: state.objective, updated_at: state.updated_at });
-    if (input.action === "list") return { memories: (await this.tasks.list(workspaceId)).map(summary) };
+    const withPlanStatus = async (state: Parameters<typeof summary>[0]) => {
+      const raw = await this.tasks.storage.readPlan(workspaceId, state.id); let plan_status: string | undefined;
+      try { plan_status = raw ? (JSON.parse(raw) as { status?: string }).status : undefined; } catch { plan_status = "corrupt"; }
+      return { ...summary(state), plan_status };
+    };
+    if (input.action === "current") {
+      const listed = await this.tasks.storage.listWithDiagnostics(workspaceId);
+      const suspended_plans = (await Promise.all(listed.memories.map(withPlanStatus))).filter((item) => item.plan_status === "suspended");
+      return { ...(await this.tasks.bootstrap(workspaceId)), active_plan: await this.plans.current(workspaceId), suspended_plans };
+    }
+    if (input.action === "list") { const listed = await this.tasks.storage.listWithDiagnostics(workspaceId); return {
+      memories: await Promise.all(listed.memories.map(withPlanStatus)), corrupt_entries: listed.corrupt_entries }; }
+    if (input.action === "read") return this.tasks.read(workspaceId, input.id);
+    if (input.action === "search") return { results: await this.tasks.search(workspaceId, input.query, input.limit) };
     if (input.action === "new") return summary(await this.tasks.create(workspaceId, String(input.title || ""), { objective: input.objective as string | undefined, phase: input.phase as string | undefined, activate: input.activate as boolean | undefined }));
     if (input.action === "activate") return summary(await this.tasks.activate(workspaceId, String(input.id || "")));
-    if (input.action === "pause" || input.action === "complete") return summary(await this.tasks.transition(workspaceId, input.action === "pause" ? "paused" : "completed", input.id as string | undefined));
+    if (input.action === "pause") return summary(await this.tasks.transition(workspaceId, "paused", input.id));
+    if (input.action === "complete") return summary(await this.tasks.complete(workspaceId, input.id, input.summary, input.limitations));
     if (input.action === "update") return summary(await this.tasks.update(workspaceId, input.id as string | undefined, { title: input.title as string | undefined,
       objective: input.objective as string | undefined, phase: input.phase as string | undefined, spec: input.spec as string | undefined }));
     if (input.action === "note") {
-      if (!input.type || !input.text) throw new Error("memory note requires type and text");
-      const state = await this.tasks.note(workspaceId, { type: input.type as never, text: String(input.text), confidence: input.confidence as never,
-        repo: input.repo as string | undefined, file: input.file as string | undefined, symbol: input.symbol as string | undefined });
+      const state = await this.tasks.note(workspaceId, { type: input.type, text: input.text, confidence: input.confidence,
+        evidence_refs: input.evidence_refs, repo: input.repo, file: input.file, symbol: input.symbol });
       return { saved: true, memory_id: state.id, note_type: input.type, updated_at: state.updated_at };
     }
-    throw new Error(`Unsupported memory action: ${input.action}`);
+    if (input.action === "resolve") return summary(await this.tasks.resolve(workspaceId, input.record_id, input.status, input.reason, input.evidence_refs));
+    if (input.action === "spec_replace") return this.tasks.replaceSpec(workspaceId, input.id, { summary: input.summary, requirements: input.requirements }, input.reason);
+    if (input.action === "spec_patch") return this.tasks.patchSpec(workspaceId, input.id, input.reason, input.operations);
+    if (input.action === "spec_rollback") return this.tasks.rollbackSpec(workspaceId, input.id, input.revision, input.reason);
+    throw new Error(`Unsupported memory action: ${(input as { action?: string }).action || "unknown"}`);
   }
 
   async plan(input: PlanInput) {
     const workspaceId = await this.workspaceId();
     if (input.action === "current") return this.plans.current(workspaceId);
-    if (input.action === "create") { await this.plans.create(workspaceId, input.steps); return this.plans.current(workspaceId); }
+    if (input.action === "create") { await this.plans.create(workspaceId, input.steps, input.exceptions); return this.plans.current(workspaceId); }
     if (input.action === "complete") return this.plans.complete(workspaceId);
-    if (input.action === "revise") { await this.plans.revise(workspaceId, input.reason, input.current_step, input.future_steps); return this.plans.current(workspaceId); }
+    if (input.action === "revise") { await this.plans.reviseOperations(workspaceId, input.reason, input.operations); return this.plans.current(workspaceId); }
+    if (input.action === "suspend") { await this.plans.transition(workspaceId, "suspended", input.reason); return this.plans.current(workspaceId); }
+    if (input.action === "reactivate") { await this.plans.transition(workspaceId, "active"); return this.plans.current(workspaceId); }
+    if (input.action === "abandon") { await this.plans.transition(workspaceId, "abandoned", input.reason); return this.plans.current(workspaceId); }
     throw new Error(`Unsupported plan action: ${(input as { action: string }).action}`);
   }
 }

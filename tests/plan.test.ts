@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { ToolRuntime } from "../src/mcp/runtime.js";
 import { PlanGuard } from "../src/plan/guard.js";
@@ -14,8 +14,8 @@ import { pluginSource } from "../src/integrations/templates.js";
 import { fixture, fixtureWorkspace, isolated, projectRoot } from "./helpers.js";
 
 const step = (id: string, repo: string, file: string, command: string) => ({
-  id, title: `Implement ${id}`, objective: `Complete ${id} without unrelated changes`,
-  writes: [{ repo, path: file }], context: [{ repo, file }], acceptance: [`${id} behavior is correct`],
+  id, kind: "implementation" as const, title: `Implement ${id}`, objective: `Complete ${id} without unrelated changes`, covers: ["R1"],
+  writes: [{ repo, path: file, covers: ["R1"] }], context: [{ repo, file }], acceptance: [{ statement: `${id} behavior is correct`, covers: ["R1"] }],
   verification: [{ command, expect_exit: 0 }],
 });
 
@@ -29,6 +29,7 @@ test("plan requires active memory and confirmed spec, binds the hash internally,
     await runtime.memory({ action: "update", spec: "Duration calculations preserve existing behavior." });
     const created = await runtime.plan({ action: "create", steps }) as any;
     assert.equal(created.active, true); assert.equal(created.step.id, "S1"); assert.equal(created.total, 2);
+    assert.deepEqual(created.step.acceptance[0], { id: "A1", statement: "S1 behavior is correct", covers: ["R1"], verification_ids: ["V1"] });
     assert.doesNotMatch(JSON.stringify(created), /S2 behavior|npm test -- shared/);
     const state = await runtime.plans.state("planning"); assert.match(state.plan?.spec_hash || "", /^[a-f0-9]{64}$/);
     const restarted = new ToolRuntime(); const resumed = await restarted.plan({ action: "current" }) as any;
@@ -41,6 +42,7 @@ test("plan requires active memory and confirmed spec, binds the hash internally,
 
 test("PlanGuard enforces current scope, generations, verification freshness, advancement, staleness, and revision", async () => {
   const original = process.env.CODE_INTELLIGENCE_WORKSPACE; const env = await fixtureWorkspace("plan-guard");
+  const editedFile = fixture("backend/src/PlanningService.ts"); const originalSource = await readFile(editedFile, "utf8");
   try {
     const runtime = new ToolRuntime(); await runtime.memory({ action: "new", title: "Guarded duration" });
     await runtime.memory({ action: "update", spec: "Implement and verify duration changes." });
@@ -54,6 +56,7 @@ test("PlanGuard enforces current scope, generations, verification freshness, adv
     assert.equal((await guard.beforeShell("planning", "echo changed > src/PlanningService.ts")).allowed, false);
 
     assert.equal(await guard.afterVerification("planning", "npm test -- backend", 0), true);
+    await writeFile(editedFile, `${originalSource}\n// guarded mutation\n`);
     await guard.afterMutation("planning");
     let completion = await runtime.plan({ action: "complete", evidence: "tests passed", verified_generation: 1 } as any) as any;
     assert.equal(completion.advanced, false); assert.match(completion.missing.join("\n"), /generation 1/);
@@ -67,10 +70,12 @@ test("PlanGuard enforces current scope, generations, verification freshness, adv
     await runtime.memory({ action: "update", spec: "The confirmed specification changed." });
     assert.equal((await guard.beforeMutation("planning", [fixture("shared/src/duration.ts")])).allowed, false);
     completion = await runtime.plan({ action: "complete" }) as any; assert.equal(completion.advanced, false); assert.match(completion.missing.join("\n"), /stale/);
-    await assert.rejects(runtime.plan({ action: "revise", reason: "Wrong owner", current_step: first, future_steps: [] }), /cannot skip.*S2/);
-    const revised = await runtime.plan({ action: "revise", reason: "Spec changed and S2 remains the bounded implementation target", current_step: second, future_steps: [] }) as any;
+    const { id: _serverId, ...replacement } = second;
+    const revised = await runtime.plan({ action: "revise", reason: "Spec changed and S2 remains the bounded implementation target",
+      operations: [{ op: "replace_current", step: replacement }] }) as any;
     assert.equal(revised.revision, 2); assert.equal(revised.stale, false); assert.equal(revised.step.id, "S2");
   } finally {
+    await writeFile(editedFile, originalSource);
     if (original === undefined) delete process.env.CODE_INTELLIGENCE_WORKSPACE; else process.env.CODE_INTELLIGENCE_WORKSPACE = original;
     await env.cleanup();
   }
@@ -79,6 +84,7 @@ test("PlanGuard enforces current scope, generations, verification freshness, adv
 test("installed OpenCode execute.before hook denies an actual out-of-step editor request", async () => {
   const originalWorkspace = process.env.CODE_INTELLIGENCE_WORKSPACE; const originalPath = process.env.PATH;
   const env = await fixtureWorkspace("plan-opencode-hook");
+  const editedFile = fixture("backend/src/PlanningService.ts"); const originalSource = await readFile(editedFile, "utf8");
   try {
     const runtime = new ToolRuntime(); await runtime.memory({ action: "new", title: "Hook guard" });
     await runtime.memory({ action: "update", spec: "Only the current backend file may change." });
@@ -97,11 +103,13 @@ test("installed OpenCode execute.before hook denies an actual out-of-step editor
     assert.equal(before.length, 1); assert.equal(after.length, 1);
     await before[0]!({ tool: "edit", input: { filePath: fixture("backend/src/PlanningService.ts") } });
     await assert.rejects(before[0]!({ tool: "edit", input: { filePath: fixture("shared/src/duration.ts") } }), /does not authorize shared:src\/duration\.ts/);
-    await after[0]!({ tool: "edit", status: "completed", input: { filePath: fixture("backend/src/PlanningService.ts") }, result: {} });
+    await writeFile(editedFile, `${originalSource}\n// plugin mutation\n`);
+    await after[0]!({ tool: "edit", status: "completed", input: { filePath: editedFile }, result: {} });
     await before[0]!({ tool: "execute", input: { code: "npm test -- backend" } });
     await after[0]!({ tool: "execute", status: "completed", input: { code: "npm test -- backend" }, result: { output: { ok: true } } });
     assert.equal(((await runtime.plan({ action: "complete" })) as any).advanced, true, "the after hook records fresh mechanical verification");
   } finally {
+    await writeFile(editedFile, originalSource);
     process.env.PATH = originalPath;
     if (originalWorkspace === undefined) delete process.env.CODE_INTELLIGENCE_WORKSPACE; else process.env.CODE_INTELLIGENCE_WORKSPACE = originalWorkspace;
     await env.cleanup();
@@ -124,7 +132,7 @@ test("plan paths reject unknown repositories, traversal, absolute and symlink es
     await assert.rejects(plans.create("planning", [{ ...base, writes: [{ repo: "repo", path: "../outside.ts" }] }]), /escapes/);
     await assert.rejects(plans.create("planning", [{ ...base, writes: [{ repo: "repo", path: outside }] }]), /Absolute/);
     await assert.rejects(plans.create("planning", [{ ...base, writes: [{ repo: "repo", path: "src/escape.ts" }] }]), /Symlink escapes/);
-    const writes = ["a.ts", "b.ts", "c.ts"].map((name) => ({ repo: "repo", path: `src/${name}` }));
+    const writes = ["a.ts", "b.ts", "c.ts"].map((name) => ({ repo: "repo", path: `src/${name}`, covers: ["R1"] }));
     await assert.rejects(plans.create("planning", [{ ...base, writes }]), /3 or more writable files require/);
     const accepted = await plans.create("planning", [{ ...base, writes, multi_file_justification: "One atomic generated contract update across three tightly coupled files." }]);
     assert.equal(accepted.steps[0]?.writes.length, 3);

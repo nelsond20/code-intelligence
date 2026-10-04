@@ -8,6 +8,7 @@ export interface ContextReference {
   snippet: string;
   score: number;
   reason?: string;
+  available_views?: InspectView[];
   metadata?: Record<string, unknown>;
 }
 export interface FindRequest { query: string; workspace?: string; scope?: string; sources?: ContextSource[]; limit?: number; }
