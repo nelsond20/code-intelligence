@@ -24,9 +24,9 @@ test("plan requires active memory and confirmed spec, binds the hash internally,
   try {
     const runtime = new ToolRuntime(); const steps = [step("S1", "backend", "src/PlanningService.ts", "npm test -- backend"), step("S2", "shared", "src/duration.ts", "npm test -- shared")];
     await assert.rejects(runtime.plan({ action: "create", steps }), /active memory/);
-    await runtime.memory({ action: "new", title: "Duration work" });
+    await runtime.tasks.create("planning", "Duration work");
     await assert.rejects(runtime.plan({ action: "create", steps }), /confirmed spec/);
-    await runtime.memory({ action: "update", spec: "Duration calculations preserve existing behavior." });
+    await runtime.tasks.update("planning", undefined, { spec: "Duration calculations preserve existing behavior." });
     const created = await runtime.plan({ action: "create", steps }) as any;
     assert.equal(created.active, true); assert.equal(created.step.id, "S1"); assert.equal(created.total, 2);
     assert.deepEqual(created.step.acceptance[0], { id: "A1", statement: "S1 behavior is correct", covers: ["R1"], verification_ids: ["V1"] });
@@ -44,8 +44,8 @@ test("PlanGuard enforces current scope, generations, verification freshness, adv
   const original = process.env.CODE_INTELLIGENCE_WORKSPACE; const env = await fixtureWorkspace("plan-guard");
   const editedFile = fixture("backend/src/PlanningService.ts"); const originalSource = await readFile(editedFile, "utf8");
   try {
-    const runtime = new ToolRuntime(); await runtime.memory({ action: "new", title: "Guarded duration" });
-    await runtime.memory({ action: "update", spec: "Implement and verify duration changes." });
+    const runtime = new ToolRuntime(); await runtime.tasks.create("planning", "Guarded duration");
+    await runtime.tasks.update("planning", undefined, { spec: "Implement and verify duration changes." });
     const first = step("S1", "backend", "src/PlanningService.ts", "npm test -- backend");
     const second = step("S2", "shared", "src/duration.ts", "npm test -- shared");
     await runtime.plan({ action: "create", steps: [first, second] });
@@ -67,7 +67,7 @@ test("PlanGuard enforces current scope, generations, verification freshness, adv
     assert.deepEqual({ advanced: completion.advanced, completed: completion.completed_step, current: completion.current_step }, { advanced: true, completed: "S1", current: "S2" });
     assert.equal(((await runtime.plan({ action: "current" })) as any).step.id, "S2", "the model cannot select or skip the server-owned step");
 
-    await runtime.memory({ action: "update", spec: "The confirmed specification changed." });
+    await runtime.tasks.update("planning", undefined, { spec: "The confirmed specification changed." });
     assert.equal((await guard.beforeMutation("planning", [fixture("shared/src/duration.ts")])).allowed, false);
     completion = await runtime.plan({ action: "complete" }) as any; assert.equal(completion.advanced, false); assert.match(completion.missing.join("\n"), /stale/);
     const { id: _serverId, ...replacement } = second;
@@ -86,8 +86,8 @@ test("installed OpenCode execute.before hook denies an actual out-of-step editor
   const env = await fixtureWorkspace("plan-opencode-hook");
   const editedFile = fixture("backend/src/PlanningService.ts"); const originalSource = await readFile(editedFile, "utf8");
   try {
-    const runtime = new ToolRuntime(); await runtime.memory({ action: "new", title: "Hook guard" });
-    await runtime.memory({ action: "update", spec: "Only the current backend file may change." });
+    const runtime = new ToolRuntime(); await runtime.tasks.create("planning", "Hook guard");
+    await runtime.tasks.update("planning", undefined, { spec: "Only the current backend file may change." });
     await runtime.plan({ action: "create", steps: [step("S1", "backend", "src/PlanningService.ts", "npm test -- backend")] });
     const bin = path.join(env.root, "bin"); await mkdir(bin, { recursive: true });
     const executable = path.join(bin, "code-intelligence");

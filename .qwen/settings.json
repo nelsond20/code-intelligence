@@ -1,0 +1,6 @@
+{
+  "tools": {
+    "visible": ["mcp__code-intelligence__memory"]
+  },
+  "$version": 4
+}

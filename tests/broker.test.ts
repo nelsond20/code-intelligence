@@ -48,7 +48,7 @@ test("broker bounds snippets and result count", async () => {
 test("context.inspect automatically records only mechanical inspection state", async () => {
   const env = await fixtureWorkspace("inspection-bookkeeping");
   try {
-    const runtime = new ToolRuntime(); await runtime.memory({ action: "new", title: "Inspect planning" });
+    const runtime = new ToolRuntime(); await runtime.tasks.create("planning", "Inspect planning");
     const found = await runtime.contextFind({ query: "calculateDuration", sources: ["code"], limit: 2 });
     await runtime.contextInspect({ ref: found.results[0]!.ref, view: "content" });
     const current = await runtime.tasks.current("planning");

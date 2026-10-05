@@ -10,6 +10,7 @@ export const requirementSchema = z.object({
   id: z.string().regex(/^R[1-9][0-9]*$/), statement: z.string().trim().min(1).max(10_000),
   kind: z.enum(["behavior", "constraint"]), priority: z.enum(["must", "should"]),
 });
+export const desiredRequirementInput = requirementSchema.omit({ id: true }).extend({ id: requirementSchema.shape.id.optional() }).strict();
 export const structuredSpecSchema = z.object({
   revision: z.number().int().min(1), summary: z.string().trim().min(1).max(50_000), requirements: z.array(requirementSchema).min(1).max(500),
   reason: z.string().max(2_000).optional(), created_at: z.string(),

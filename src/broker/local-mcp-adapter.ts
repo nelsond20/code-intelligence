@@ -178,7 +178,7 @@ export class LocalMcpAdapter implements ContextBackend {
 
   private async session<T>(action: (client: Client, tools: string[], token?: string) => Promise<T>): Promise<T> {
     let token: string | undefined;
-    const client = new Client({ name: "code-intelligence-broker", version: "0.2.0" });
+    const client = new Client({ name: "code-intelligence-broker", version: "0.3.0" });
     try {
       const created = await this.transport(); token = created.token;
       await deadline(client.connect(created.transport), this.timeout(3_000), `${this.source} connection`);

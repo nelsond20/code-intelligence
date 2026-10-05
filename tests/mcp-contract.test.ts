@@ -8,6 +8,7 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv
 import { createMcpServer } from "../src/mcp/server.js";
 import { fixtureWorkspace, isolated } from "./helpers.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
+import { TaskService } from "../src/task-state/service.js";
 
 async function connectedClient(name = "qwen-code") {
   const server = createMcpServer();
@@ -22,46 +23,40 @@ async function connectedClient(name = "qwen-code") {
   return { client, call, close: async () => { await client.close(); await server.close(); } };
 }
 
-test("tools/list publishes actionable action branches instead of empty memory/plan schemas", async () => {
+test("tools/list publishes a flat four-action memory schema", async () => {
   const { client, close } = await connectedClient();
   try {
     const tools = (await client.listTools()).tools;
     assert.deepEqual(tools.map((item) => item.name), ["context.find", "context.inspect", "memory", "plan"]);
     const memory = tools.find((item) => item.name === "memory")!;
     const plan = tools.find((item) => item.name === "plan")!;
-    assert.match(memory.description!, /create one constraint MUST spec requirement.*action spec_replace/i);
-    assert.match(memory.description!.slice(0, 90), /"action":"new","title"/);
+    assert.match(memory.description!.slice(0, 70), /"action":"current"/);
+    assert.match(memory.description!, /"action":"spec_set"/);
+    assert.match(memory.description!, /never send memory_id/);
     assert.match(plan.description!.slice(0, 100), /"action":"create","steps"/);
-    assert.ok((memory.inputSchema.properties?.action as { enum: string[] }).enum.includes("spec_replace"));
-    assert.ok(!(memory.inputSchema.properties?.action as { enum: string[] }).enum.includes("spec_must"));
+    assert.deepEqual((memory.inputSchema.properties?.action as { enum: string[] }).enum, ["current", "note", "resolve", "spec_set"]);
+    for (const key of ["anyOf", "oneOf", "allOf", "if", "then"]) assert.equal((memory.inputSchema as Record<string, unknown>)[key], undefined);
+    assert.deepEqual(memory.inputSchema.required, ["action"]);
+    assert.equal(memory.inputSchema.additionalProperties, false);
     assert.ok((plan.inputSchema.properties?.action as { enum: string[] }).enum.includes("create"));
     const memoryRoot = memory.inputSchema.properties as Record<string, any>;
     const planRoot = plan.inputSchema.properties as Record<string, any>;
-    assert.ok(memoryRoot.title && memoryRoot.summary && memoryRoot.requirements && memoryRoot.type && memoryRoot.record_id);
+    assert.ok(memoryRoot.summary && memoryRoot.requirements && memoryRoot.type && memoryRoot.record_id);
+    assert.equal(memoryRoot.title, undefined);
     assert.equal(memoryRoot.state, undefined); assert.equal(memoryRoot.context, undefined);
     assert.deepEqual(memoryRoot.requirements.items.required, ["statement", "kind", "priority"]);
     assert.deepEqual(memoryRoot.requirements.items.properties.kind.enum, ["behavior", "constraint"]);
     assert.deepEqual(memoryRoot.requirements.items.properties.priority.enum, ["must", "should"]);
+    assert.match(memoryRoot.requirements.description, /Each item requires statement, kind, and priority/);
+    for (const field of ["statement", "kind", "priority", "id"]) assert.ok(memoryRoot.requirements.items.properties[field].description);
+    assert.match(memoryRoot.requirements.items.properties.priority.description, /lowercase must or should/);
+    assert.match(memoryRoot.requirements.items.properties.id.description, /Omit for a new requirement/);
     assert.ok(planRoot.steps && !planRoot.title && !planRoot.description);
     assert.deepEqual(planRoot.steps.items.required, ["title", "objective", "acceptance", "verification"]);
     assert.ok(planRoot.steps.items.properties.acceptance.items.anyOf);
     assert.ok(planRoot.steps.items.properties.verification.items.properties.program);
-    for (const [tool, actions] of [[memory, ["new", "note", "resolve", "spec_replace"]], [plan, ["create", "current", "abandon"]]] as const) {
-      assert.equal(tool.inputSchema.type, "object");
-      const branches = tool.inputSchema.anyOf as Array<{ properties: Record<string, any>; required: string[] }>;
-      assert.ok(branches.length >= actions.length);
-      for (const action of actions) assert.ok(branches.some((branch) => branch.properties.action.const === action));
-      for (const branch of branches) for (const name of Object.keys(branch.properties)) assert.ok(tool.inputSchema.properties?.[name], `${tool.name}.${name} missing from root projection`);
-      assert.doesNotMatch(JSON.stringify(tool.inputSchema), /"workspace":/);
-    }
-    const memoryBranches = memory.inputSchema.anyOf as Array<{ properties: Record<string, any>; required: string[] }>;
-    const spec = memoryBranches.find((item) => item.properties.action.const === "spec_replace")!;
-    assert.ok(memoryBranches.indexOf(spec) < 3, "spec creation must appear near memory creation in tools/list");
-    assert.deepEqual(spec.required, ["action", "summary", "requirements"]);
-    assert.match(spec.properties.action.description, /Create the first structured spec/);
-    assert.match(spec.properties.action.description, /There is no spec_must action/);
-    assert.match(spec.properties.requirements.items.properties.kind.description, /constraint/);
-    assert.match(spec.properties.requirements.items.properties.priority.description, /MUST requirement/);
+    assert.equal(plan.inputSchema.type, "object");
+    assert.doesNotMatch(JSON.stringify(memory.inputSchema), /"workspace":/);
     const planBranches = plan.inputSchema.anyOf as Array<{ properties: Record<string, any>; required: string[] }>;
     const create = planBranches.find((item) => item.properties.action.const === "create")!;
     assert.ok(create.properties.steps.items.properties.kind.description.includes("investigation"));
@@ -72,11 +67,15 @@ test("tools/list publishes actionable action branches instead of empty memory/pl
     const requirement = { statement: "preflightSentinel returns true only for ready", kind: "constraint", priority: "must" };
     const investigation = { kind: "investigation", title: "Inspect sentinel", objective: "Find evidence", covers: ["R1"],
       acceptance: [{ statement: "Evidence found", covers: ["R1"] }], verification: [{ kind: "custom", program: "node", args: ["--version"] }] };
-    assert.equal(memoryCheck({ action: "new", title: "Preflight" }).valid, true);
-    assert.equal(memoryCheck({ action: "spec_replace", summary: "Sentinel constraint", requirements: [requirement] }).valid, true);
+    assert.equal(memoryCheck({ action: "current" }).valid, true);
+    assert.equal(memoryCheck({ action: "note", type: "observation", text: "Observed", memory_id: "other-memory" }).valid, false);
+    assert.equal(memoryCheck({ action: "spec_set", summary: "Sentinel constraint", requirements: [requirement] }).valid, true);
+    assert.equal(memoryCheck({ action: "spec_set", summary: "Sentinel constraint", requirements: [{ ...requirement, id: "MEM-1" }] }).valid, false);
+    assert.equal(memoryCheck({ action: "spec_set", summary: "Sentinel constraint", requirements: [{ ...requirement, priority: "MUST" }] }).valid, false);
+    assert.equal(memoryCheck({ action: "spec_set", summary: "Sentinel constraint", requirements: [{ statement: requirement.statement, priority: "must" }] }).valid, false);
     assert.equal(planCheck({ action: "create", steps: [investigation] }).valid, true);
-    assert.equal(memoryCheck({ action: "new", title: "Preflight", state: "discovering", context: "Invented" }).valid, false);
-    assert.equal(memoryCheck({ action: "spec_replace", title: "Wrong", requirements: [{ id: "req-001", type: "constraint", severity: "MUST", description: "Invented" }] }).valid, false);
+    assert.equal(memoryCheck({ action: "new", title: "Preflight" }).valid, false);
+    assert.equal(memoryCheck({ action: "spec_set", title: "Wrong", requirements: [{ id: "req-001", type: "constraint", severity: "MUST", description: "Invented" }] }).valid, false);
     assert.equal(planCheck({ action: "create", title: "Wrong", steps: [{ id: "step-1", kind: "investigation", description: "Invented", writes: [] }] }).valid, false);
   } finally { await close(); }
 });
@@ -114,10 +113,12 @@ test("MCP preflight and evidence flow are self-contained and reject misleading n
   const env = await fixtureWorkspace("mcp-contract-flow");
   const { call, close } = await connectedClient();
   try {
+    const empty = await call("memory", { action: "current" });
+    assert.equal(empty.code, "NO_ACTIVE_MEMORY");
+    assert.match(empty.next_action, /operator/);
     let response = await call("memory", { action: "create", title: "Wrong discriminator" });
-    assert.equal(response.code, "INVALID_INPUT"); assert.match(response.message, /new/); assert.equal(response.diagnostics.state_unchanged, true);
-    response = await call("memory", { action: "new", title: "Contract flow", objective: "Inspect and plan" });
-    assert.equal(response.status, "ok"); const memoryId = response.data.id as string;
+    assert.equal(response.code, "INVALID_MEMORY_ACTION_PAYLOAD"); assert.match(response.message, /memory.create/); assert.equal(response.diagnostics.state_unchanged, true);
+    const memoryId = (await new TaskService().create("planning", "Contract flow", { objective: "Inspect and plan" })).id;
     response = await call("memory", { action: "resolve", record_id: "M9", status: "confirmed", reason: "Guess" });
     assert.equal(response.code, "RECORD_NOT_FOUND");
     response = await call("memory", { action: "note", type: "observation", text: "Unverified observation" });
@@ -128,15 +129,17 @@ test("MCP preflight and evidence flow are self-contained and reject misleading n
     assert.equal(found.status, "ok"); const ref = found.data.results[0].ref as string;
     assert.equal((await call("context.inspect", { ref, view: "content" })).status, "ok");
     response = await call("memory", { action: "note", type: "evidence", body: "Wrong", tags: ["x"] });
-    assert.equal(response.code, "INVALID_INPUT"); assert.match(response.message, /body.*text/); assert.equal(response.diagnostics.state_unchanged, true);
+    assert.equal(response.code, "INVALID_MEMORY_ACTION_PAYLOAD"); assert.match(response.message, /body.*text/); assert.equal(response.diagnostics.state_unchanged, true);
     response = await call("memory", { action: "note", type: "evidence", text: "Inspected implementation", evidence_refs: [ref] });
     assert.equal(response.data.record_id, "M2"); assert.equal(response.data.record_status, "supported");
     response = await call("memory", { action: "resolve", record_id: "M2", status: "confirmed", reason: "Direct inspection" });
     assert.equal(response.data.record_status, "confirmed");
-    response = await call("memory", { action: "spec_replace", spec: { summary: "Wrong nesting", requirements: [] } });
-    assert.equal(response.code, "INVALID_INPUT"); assert.match(response.message, /spec.*summary and requirements/);
-    response = await call("memory", { action: "spec_replace", summary: "Read-only preflight", requirements: [{ statement: "Investigate the implementation", kind: "constraint", priority: "must" }] });
-    assert.equal(response.data.requirements[0].id, "R1");
+    response = await call("memory", { action: "spec_set", spec: { summary: "Wrong nesting", requirements: [] } });
+    assert.equal(response.code, "INVALID_MEMORY_ACTION_PAYLOAD"); assert.match(response.message, /memory.spec_set/);
+    assert.deepEqual(response.diagnostics.missing.sort(), ["requirements", "summary"]);
+    assert.deepEqual(response.diagnostics.unexpected, ["spec"]);
+    response = await call("memory", { action: "spec_set", summary: "Read-only preflight", requirements: [{ statement: "Investigate the implementation", kind: "constraint", priority: "must" }] });
+    assert.equal(response.data.spec.requirements[0].id, "R1");
     response = await call("plan", { action: "new", steps: [] });
     assert.equal(response.code, "INVALID_INPUT"); assert.match(response.message, /create/);
     const baseStep = { kind: "investigation", title: "Inspect", objective: "Find evidence", covers: ["R1"], acceptance: [{ statement: "Evidence identified", covers: ["R1"] }], verification: [{ kind: "custom", program: "node", args: ["--version"] }] };
@@ -161,7 +164,7 @@ test("MCP preflight and evidence flow are self-contained and reject misleading n
     response = await call("plan", { action: "create", steps: [{ ...baseStep, kind: "verification", title: "Verify" }] });
     assert.equal(response.status, "ok"); assert.equal(response.data.step.kind, "verification");
     await call("plan", { action: "abandon", reason: "Verification shape checked" });
-    assert.equal((await call("memory", { action: "complete", summary: "Preflight completed" })).status, "ok");
+    assert.equal((await new TaskService().complete("planning", memoryId, "Preflight completed")).status, "completed");
   } finally {
     await close();
     if (previous === undefined) delete process.env.CODE_INTELLIGENCE_WORKSPACE; else process.env.CODE_INTELLIGENCE_WORKSPACE = previous;
@@ -174,8 +177,8 @@ test("MCP plan errors identify step, write, acceptance and verification without 
   const env = await fixtureWorkspace("mcp-coverage-errors");
   const { call, close } = await connectedClient();
   try {
-    await call("memory", { action: "new", title: "Coverage diagnostics" });
-    await call("memory", { action: "spec_replace", summary: "Behavior", requirements: [{ statement: "Behavior works", kind: "behavior", priority: "must" }] });
+    await new TaskService().create("planning", "Coverage diagnostics");
+    await call("memory", { action: "spec_set", summary: "Behavior", requirements: [{ statement: "Behavior works", kind: "behavior", priority: "must" }] });
     const step = { kind: "implementation", title: "Implement", objective: "Change behavior", covers: ["R1"],
       writes: [{ repo: "backend", path: "src/PlanningService.ts", covers: ["R1"] }],
       acceptance: [{ statement: "Behavior is correct", covers: ["R1"] }],

@@ -26,7 +26,51 @@ test("schema diagnostic distinguishes published, searched, and unobserved initia
     assert.ok(result.every((item) => item.tool_search_equals_tools_list && item.tool_search_description_equals_tools_list));
     assert.ok(result.every((item) => item.initial_equals_tools_list === false && item.initial.missing_critical_fields.length > 0));
     assert.ok(result.every((item) => item.tools_list.missing_critical_fields.length === 0));
+    const memory = result.find((item) => item.tool === "memory")!;
+    assert.deepEqual(memory.tools_list.requirement_contract?.required, ["statement", "kind", "priority"]);
+    assert.equal(memory.tools_list.requirement_contract?.id_optional, true);
+    assert.deepEqual(memory.tools_list.requirement_contract?.field_enums, { kind: ["behavior", "constraint"], priority: ["must", "should"] });
+    assert.deepEqual(memory.tools_list.requirement_contract?.missing_guidance, []);
+    assert.equal(memory.initial_description_equals_tools_list, false);
+    const projectedSchema = structuredClone(listed.find((tool) => tool.name === "memory")!.inputSchema) as Record<string, any>;
+    delete projectedSchema.properties.requirements.items.properties.kind.enum;
+    delete projectedSchema.properties.requirements.items.properties.priority.enum;
+    delete projectedSchema.properties.requirements.items.properties.priority.description;
+    const projected = parseInitialTools({ tools: [{ name: "mcp__code-intelligence__memory", parametersJsonSchema: projectedSchema }] });
+    const projectedResult = compareToolSchemas(serverTools, searched, projected).find((item) => item.tool === "memory")!;
+    assert.deepEqual(projectedResult.initial.missing_critical_fields, []);
+    assert.deepEqual(projectedResult.initial.requirement_contract?.field_enums, { kind: [], priority: [] });
+    assert.deepEqual(projectedResult.initial.requirement_contract?.missing_guidance, ["priority"]);
+    const initialOnly = compareToolSchemas(serverTools, undefined, projected).find((item) => item.tool === "memory")!;
+    assert.equal(initialOnly.tool_search_equals_tools_list, null);
+    assert.equal(initialOnly.initial_equals_tools_list, false);
+    assert.equal(compareToolSchemas(serverTools, undefined, projected).find((item) => item.tool === "plan")!.initial.observed, false);
     assert.ok(compareToolSchemas(serverTools, searched).every((item) => item.initial.observed === false && item.initial_equals_tools_list === null));
+    const normalized = structuredClone(listed.find((tool) => tool.name === "memory")!.inputSchema) as Record<string, any>;
+    delete normalized.$schema;
+    delete normalized.additionalProperties;
+    delete normalized.properties.requirements.items.additionalProperties;
+    delete normalized.properties.requirements.items.properties.statement.maxLength;
+    delete normalized.properties.summary.maxLength;
+    delete normalized.properties.evidence_refs.items.maxLength;
+    delete normalized.properties.reason.maxLength;
+    delete normalized.properties.text.maxLength;
+    const normalizedInitial = parseInitialTools({ tools: [{ name: "mcp__code-intelligence__memory",
+      description: listed.find((tool) => tool.name === "memory")!.description, parametersJsonSchema: normalized }] });
+    const normalizedResult = compareToolSchemas(serverTools, undefined, normalizedInitial).find((item) => item.tool === "memory")!;
+    assert.equal(normalizedResult.initial_spec_set_contract_preserved, false);
+    assert.deepEqual(normalizedResult.initial_schema_differences?.filter((difference) => difference.category === "A")
+      .map((difference) => difference.path), ["/additionalProperties", "/properties/requirements/items/additionalProperties",
+        "/properties/requirements/items/properties/statement/maxLength", "/properties/summary/maxLength"]);
+    normalized.additionalProperties = false;
+    normalized.properties.requirements.items.additionalProperties = false;
+    normalized.properties.requirements.items.properties.statement.maxLength = 10000;
+    normalized.properties.summary.maxLength = 50000;
+    const restoredResult = compareToolSchemas(serverTools, undefined, normalizedInitial).find((item) => item.tool === "memory")!;
+    assert.equal(restoredResult.initial_spec_set_contract_preserved, true);
+    assert.equal(restoredResult.initial_equals_tools_list, false);
+    assert.equal(restoredResult.initial_schema_differences?.length, 4);
+    assert.ok(restoredResult.initial_schema_differences?.every((difference) => difference.category === "B"));
     assert.doesNotMatch(JSON.stringify(result), /private description|Investigate bug|Observable condition/);
   } finally { await client.close(); await server.close(); }
 });

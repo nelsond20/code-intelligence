@@ -38,6 +38,11 @@ async function run(): Promise<void> {
   const [command, subcommand] = args;
   const registry = new WorkspaceRegistry(); const tasks = new TaskService(); const plans = new PlanService(undefined, tasks, registry); const guard = new PlanGuard(plans, registry);
   if (command === "serve-mcp") return (await import("../mcp/server.js")).serveMcp();
+  if (command === "ui") {
+    const port = Number(option("--port") || 4317);
+    const url = await (await import("../control/server.js")).serveControlUi(port);
+    output(`Memory control plane: ${url}`); return;
+  }
   if (command === "integration" && subcommand === "heartbeat") {
     const workspace = workspaceFromArgs(); await atomicWrite(path.join(appPaths().dataDir, "guard-heartbeat.json"),
       `${JSON.stringify({ version: 2, integration: "opencode", workspace, at: new Date().toISOString() })}\n`); return output({ recorded: true });
@@ -113,7 +118,8 @@ async function run(): Promise<void> {
   code-intelligence memory new|list|current|activate|pause|complete|context --workspace <id>
   code-intelligence plan current --workspace <id>
   code-intelligence install-opencode|uninstall-opencode [--dry-run] [--yes]
-  code-intelligence serve-mcp`);
+  code-intelligence serve-mcp
+  code-intelligence ui [--port 4317]`);
   if (command) process.exitCode = 1;
 }
 

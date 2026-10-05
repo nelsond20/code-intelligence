@@ -48,32 +48,74 @@ function hash(value: unknown): string | null {
   return value === undefined ? null : crypto.createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
 }
 
+const irrelevantMemoryTransportPaths = new Set([
+  "/$schema",
+  "/properties/evidence_refs/items/maxLength",
+  "/properties/reason/maxLength",
+  "/properties/text/maxLength",
+]);
+
+function schemaDifferences(expected: unknown, actual: unknown, location = ""): string[] {
+  if (hash(expected) === hash(actual)) return [];
+  const left = object(expected); const right = object(actual);
+  if (left && right) return [...new Set([...Object.keys(left), ...Object.keys(right)])].sort()
+    .flatMap((key) => schemaDifferences(left[key], right[key], `${location}/${key}`));
+  if (Array.isArray(expected) && Array.isArray(actual) && expected.length === actual.length)
+    return expected.flatMap((item, index) => schemaDifferences(item, actual[index], `${location}/${index}`));
+  return [location || "/"];
+}
+
 function field(schema: JsonObject | undefined, ...parts: string[]): unknown {
   let current: unknown = schema;
   for (const part of parts) current = object(current)?.[part];
   return current;
 }
 
+function requirementContract(root: JsonObject | undefined) {
+  const item = object(field(root, "properties", "requirements", "items"));
+  const required = Array.isArray(item?.required) ? item.required : [];
+  const fields = ["statement", "kind", "priority", "id"] as const;
+  const properties = object(item?.properties);
+  return {
+    required,
+    id_optional: item ? !required.includes("id") : null,
+    field_description_present: Object.fromEntries(fields.map((name) => [name, typeof object(properties?.[name])?.description === "string"])),
+    field_enums: Object.fromEntries(["kind", "priority"].map((name) => [name,
+      Array.isArray(object(properties?.[name])?.enum) ? object(properties?.[name])!.enum : []])),
+    missing_guidance: fields.filter((name) => typeof object(properties?.[name])?.description !== "string"),
+  };
+}
+
 function summarize(tool: DiagnosticTool | undefined, name: "memory" | "plan") {
   const root = tool?.schema;
   const critical = name === "memory"
-    ? ["properties.title", "properties.summary", "properties.requirements", "properties.requirements.items.properties.statement",
+    ? ["properties.action", "properties.summary", "properties.requirements", "properties.requirements.items.properties.statement",
       "properties.requirements.items.properties.kind", "properties.requirements.items.properties.priority"]
     : ["properties.steps", "properties.steps.items.properties.title", "properties.steps.items.properties.objective",
       "properties.steps.items.properties.acceptance", "properties.steps.items.properties.verification"];
   return { observed: Boolean(tool), schema_observed: Boolean(root), schema_sha256: hash(root), description_sha256: hash(tool?.description),
+    description_length: tool?.description?.length ?? null,
     root_properties: Object.keys(object(root?.properties) || {}), root_required: Array.isArray(root?.required) ? root.required : [],
-    missing_critical_fields: critical.filter((key) => field(root, ...key.split(".")) === undefined) };
+    missing_critical_fields: critical.filter((key) => field(root, ...key.split(".")) === undefined),
+    ...(name === "memory" ? { requirement_contract: requirementContract(root) } : {}) };
 }
 
-export function compareToolSchemas(server: DiagnosticTool[], toolSearch: DiagnosticTool[], initial?: DiagnosticTool[]) {
+export function compareToolSchemas(server: DiagnosticTool[], toolSearch?: DiagnosticTool[], initial?: DiagnosticTool[]) {
   return (["memory", "plan"] as const).map((name) => {
     const find = (items: DiagnosticTool[] | undefined) => items?.find((tool) => publicName(tool.name) === name);
     const listed = find(server); const searched = find(toolSearch); const before = find(initial);
-    if (!listed || !searched?.schema) throw new Error(`Missing ${name} schema from tools/list or ToolSearch`);
-    return { tool: name, tool_search_equals_tools_list: hash(searched.schema) === hash(listed.schema),
-      tool_search_description_equals_tools_list: hash(searched.description) === hash(listed.description),
+    if (!listed) throw new Error(`Missing ${name} schema from tools/list`);
+    const initialDifferences = before?.schema && name === "memory"
+      ? schemaDifferences(listed.schema, before.schema).map((location) => ({ path: location,
+        category: irrelevantMemoryTransportPaths.has(location) ? "B" as const : "A" as const })) : null;
+    const initialDescriptionMatches = before?.description === undefined ? null : hash(before.description) === hash(listed.description);
+    return { tool: name, tool_search_equals_tools_list: searched?.schema ? hash(searched.schema) === hash(listed.schema) : null,
+      tool_search_description_equals_tools_list: searched ? hash(searched.description) === hash(listed.description) : null,
       initial_equals_tools_list: before?.schema ? hash(before.schema) === hash(listed.schema) : null,
+      initial_description_equals_tools_list: initialDescriptionMatches,
+      ...(name === "memory" ? { initial_schema_differences: initialDifferences,
+        initial_spec_set_contract_preserved: before?.schema && initialDescriptionMatches === true
+          ? initialDifferences?.every((difference) => difference.category === "B") === true : false } : {}),
       tools_list: summarize(listed, name), tool_search: summarize(searched, name), initial: summarize(before, name) };
   });
 }
@@ -98,14 +140,19 @@ async function main(args: string[]): Promise<void> {
     if (!value || value.startsWith("--")) throw new Error(`Missing value for ${arg}`);
     if (arg === "--export") exportPath = value; else initialPath = value;
   }
-  if (!exportPath) {
-    throw new Error("Usage: model-facing-schema-diagnostic --export <Qwen export.md> [--initial <model-bound tools.json>] [--require-match]");
+  if (!exportPath && !initialPath) {
+    throw new Error("Usage: model-facing-schema-diagnostic [--export <Qwen export.md>] [--initial <model-bound tools.json>] [--require-match]");
   }
-  const exported = parseToolSearchExport(await readFile(exportPath, "utf8"));
+  const exported = exportPath ? parseToolSearchExport(await readFile(exportPath, "utf8")) : undefined;
   const initial = initialPath ? parseInitialTools(JSON.parse(await readFile(initialPath, "utf8"))) : undefined;
   const result = compareToolSchemas(await listedTools(), exported, initial);
   console.log(JSON.stringify({ schema_version: 1, initial_capture_supplied: Boolean(initialPath), tools: result }, null, 2));
-  if (requireMatch && result.some((tool) => !tool.tool_search_equals_tools_list || !tool.tool_search_description_equals_tools_list)) process.exitCode = 1;
+  const differs = (observed: boolean, schemaMatch: boolean | null, descriptionMatch: boolean | null, required: boolean) =>
+    required && !observed || observed && (schemaMatch !== true || descriptionMatch !== true);
+  if (requireMatch && result.some((tool) =>
+    Boolean(exportPath) && differs(tool.tool_search.observed, tool.tool_search_equals_tools_list,
+      tool.tool_search_description_equals_tools_list, tool.tool === "memory") ||
+    Boolean(initialPath) && tool.tool === "memory" && tool.initial_spec_set_contract_preserved !== true)) process.exitCode = 1;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

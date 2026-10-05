@@ -1,6 +1,6 @@
 {
   "name": "code-intelligence",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local code retrieval, persistent work memory, and guarded execution plans for OpenCode",
   "type": "module",
   "private": true,
@@ -26,7 +26,9 @@
     "benchmark:evaluate": "npm run build && node dist/scripts/benchmark.js evaluate",
     "model-facing:prepare": "npm run build && node dist/scripts/model-facing-eval.js prepare",
     "model-facing:evaluate": "npm run build && node dist/scripts/model-facing-eval.js evaluate",
-    "model-facing:schema-diagnostic": "npm run build && node dist/scripts/model-facing-schema-diagnostic.js"
+    "model-facing:schema-diagnostic": "npm run build && node dist/scripts/model-facing-schema-diagnostic.js",
+    "memory-control:prepare": "npm run build && node dist/scripts/memory-control-eval.js prepare",
+    "memory-control:evaluate": "npm run build && node dist/scripts/memory-control-eval.js evaluate"
   },
   "engines": {
     "node": ">=22"

@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ToolRuntime } from "./runtime.js";
 import { registerPublicTools } from "./tools.js";
+import { parseMemoryAction } from "./schemas.js";
 
 function compact(value: unknown, maxString: number, maxArray: number): unknown {
   if (typeof value === "string") return value.length <= maxString ? value : `${value.slice(0, Math.max(0, maxString - 20))}… [truncated]`;
@@ -32,14 +33,14 @@ function location(parts: Array<string | number>): string {
   return parts.reduce<string>((result, part) => typeof part === "number" ? `${result}[${part}]` : result ? `${result}.${part}` : part, "") || "input";
 }
 
-function inputFailure(error: ZodError) {
+function inputFailure(error: ZodError, action?: string) {
   const hints: Record<string, string> = {
     requirementIds: "Use covers: [\"R1\"] on the step, write, or acceptance object.",
     requirements_coverage: "Use covers: [\"R1\"] on the step, write, or acceptance object.",
     criterion: "Use statement for acceptance text.",
     body: "Use text for memory.note.",
     tags: "Use repo, file, and symbol for record context; tags is unsupported.",
-    spec: "For spec_replace, put summary and requirements at the top level.",
+    spec: "For spec_set, put summary and requirements at the top level.",
   };
   const expanded = error.issues.flatMap((issue) => {
     if (issue.code !== "invalid_union") return [issue];
@@ -57,14 +58,19 @@ function inputFailure(error: ZodError) {
     return [{ path, message }];
   }).sort((a, b) => Number(b.message.startsWith("Unknown field")) - Number(a.message.startsWith("Unknown field")) || a.path.localeCompare(b.path));
   const first = issues[0] || { path: "input", message: "Invalid input" };
-  return { status: "error", code: "INVALID_INPUT", message: `${first.message} at ${first.path}${"hint" in first && first.hint ? `. ${first.hint}` : ""}`, next_action: "Correct the reported fields and retry the same action",
-    diagnostics: { issues, state_unchanged: true } };
+  return { status: "error", code: action ? "INVALID_MEMORY_ACTION_PAYLOAD" : "INVALID_INPUT", message: `${action ? `Invalid memory.${action} payload. ` : ""}${first.message} at ${first.path}${"hint" in first && first.hint ? `. ${first.hint}` : ""}`, next_action: "Correct the reported fields and retry the same action",
+    diagnostics: { action, issues, missing: issues.filter((item) => item.message.startsWith("Required field")).map((item) => item.path),
+      unexpected: issues.filter((item) => item.message.startsWith("Unknown field")).map((item) => item.path),
+      invalid: issues.filter((item) => !item.message.startsWith("Required field") && !item.message.startsWith("Unknown field")), state_unchanged: true } };
 }
 
-function failure(error: unknown) {
-  if (error instanceof ZodError) return { ...formatToolResponse(inputFailure(error)), isError: true };
+function failure(error: unknown, action?: string) {
+  if (error instanceof ZodError) return { ...formatToolResponse(inputFailure(error, action)), isError: true };
   const message = error instanceof Error ? error.message : "Request failed";
-  const code = /Unknown memory record/i.test(message) ? "RECORD_NOT_FOUND"
+  const code = message.startsWith("NO_ACTIVE_MEMORY:") ? "NO_ACTIVE_MEMORY"
+    : /Unknown memory record/i.test(message) ? "RECORD_NOT_FOUND"
+    : /Unknown requirement in active memory/i.test(message) ? "REQUIREMENT_NOT_FOUND"
+    : /Duplicate requirement/i.test(message) ? "INVALID_MEMORY_ACTION_PAYLOAD"
     : /Unknown repository/i.test(message) ? "INVALID_INPUT"
       : /coverage|covers|requirement.*test verification/i.test(message) ? "COVERAGE_GAP"
     : /Evidence ref has not been inspected|requires inspected evidence/i.test(message) ? "EVIDENCE_NOT_INSPECTED"
@@ -72,7 +78,7 @@ function failure(error: unknown) {
         : /Verification|verification|writable path|cwd/i.test(message) ? "INVALID_VERIFICATION"
           : /No active|active memory|already has|suspended|not terminal|requires a reason|confirmed spec|Unknown memory|Completed tasks/i.test(message) ? "INVALID_STATE" : "REQUEST_FAILED";
   return { ...formatToolResponse({ status: "error", code, message: code === "REQUEST_FAILED" ? "Request failed; inspect current state and server diagnostics" : message,
-    next_action: "Correct the reported condition and retry; use memory.current or plan.current for current state" }), isError: true };
+    next_action: code === "NO_ACTIVE_MEMORY" ? "Ask the operator to select an active memory in the local control plane" : "Correct the reported condition and retry; use memory.current or plan.current for current state" }), isError: true };
 }
 
 type PublicTool = { name: string; description: string; schema: z.ZodTypeAny; handler: (input: any) => Promise<unknown> };
@@ -102,9 +108,7 @@ export function publicInputSchema(schema: z.ZodTypeAny) {
     }
   }
   const properties: Record<string, SchemaField> = { action: { type: "string", enum: actions,
-    description: actions.includes("spec_replace")
-      ? "Choose one listed action. Create the first structured spec with spec_replace; kind and priority belong inside each requirement."
-      : "Choose one listed action; see its branch for required fields." } };
+    description: "Choose one listed action; see its branch for required fields." } };
   for (const [name, { field, actions: fieldActions }] of Object.entries(rootFields)) {
     properties[name] = { ...field, description: `${typeof field.description === "string" ? `${field.description} ` : ""}Used by ${fieldActions.join(", ")}; required only where its action branch says so.` };
   }
@@ -113,7 +117,7 @@ export function publicInputSchema(schema: z.ZodTypeAny) {
 }
 
 export function createMcpServer(runtime = new ToolRuntime()): Server {
-  const server = new Server({ name: "code-intelligence", version: "0.2.0" }, { capabilities: { tools: { listChanged: false } } });
+  const server = new Server({ name: "code-intelligence", version: "0.3.0" }, { capabilities: { tools: { listChanged: false } } });
   runtime.clientName = () => server.getClientVersion()?.name;
   const tools = new Map<string, PublicTool>();
   registerPublicTools((name, description, schema, handler) => tools.set(name, { name, description, schema, handler }), runtime);
@@ -123,8 +127,10 @@ export function createMcpServer(runtime = new ToolRuntime()): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const tool = tools.get(request.params.name);
     if (!tool) return { ...formatToolResponse({ status: "error", code: "UNKNOWN_TOOL", message: "Unknown public tool", next_action: "Use a tool listed by tools/list" }), isError: true };
-    try { return formatToolResponse(await tool.handler(tool.schema.parse(request.params.arguments || {}))); }
-    catch (error) { return failure(error); }
+    try { return formatToolResponse(await tool.handler(tool.name === "memory"
+      ? parseMemoryAction((request.params.arguments || {}) as Parameters<typeof parseMemoryAction>[0])
+      : tool.schema.parse(request.params.arguments || {}))); }
+    catch (error) { return failure(error, tool.name === "memory" && typeof request.params.arguments?.action === "string" ? request.params.arguments.action : undefined); }
   });
   return server;
 }

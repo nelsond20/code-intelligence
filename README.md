@@ -1,6 +1,6 @@
 # Code Intelligence
 
-La documentación formal de la versión 0.2.0 empieza en
+La documentación formal de la versión 0.3.0 empieza en
 [docs/README.md](docs/README.md). Incluye guía completa, referencia MCP,
 configuración, operación, limitaciones, benchmark y handoff.
 
@@ -8,7 +8,7 @@ Code Intelligence is a local **Context Broker + Persistent Work Memory + Guarded
 
 - `context.find` discovers code, local documentation, vault knowledge, and Git history.
 - `context.inspect` deepens an opaque broker reference with bounded content, surroundings, relationships, commit summaries, diffs, or blame.
-- `memory` manages persistent semantic work memory and the confirmed specification.
+- `memory` reads the operator-selected active memory and manages its notes and structured specification.
 - `plan` controls an optional spec-bound ordered execution plan.
 
 The default configuration sends no source, prompts, queries, embeddings, analytics, or telemetry to remote services.
@@ -156,12 +156,12 @@ For Ornith, use context `90112` and output `8192`. This project does not change 
 
 ## Typical workflow
 
-For substantial work, call `memory` with `action: "new"`, then use `context.find` and `context.inspect`. Record durable meaning with `memory(action="note")` and resolve records by server ID. Manage structured requirements with `spec_replace`, `spec_patch`, or `spec_rollback`. For guarded work, create a coverage-checked plan, call `plan(action="current")`, work only in the current write set, verify it, and request `plan(action="complete")`. Use structured `plan(action="revise")` operations instead of silently deviating; suspend/reactivate/abandon are explicit lifecycle transitions.
+For substantial work, use `code-intelligence ui` to create and select the active memory. The agent can call `memory(action="current")`, record durable meaning with `memory(action="note")`, resolve records by server ID, and declare the complete desired structured specification with `memory(action="spec_set")`. For guarded work, create a coverage-checked plan, call `plan(action="current")`, work only in the current write set, verify it, and request `plan(action="complete")`. Use structured `plan(action="revise")` operations instead of silently deviating; suspend/reactivate/abandon are explicit lifecycle transitions.
 
 Memory lifecycle from the CLI:
 
 ```bash
-code-intelligence memory new "Planning duration correction" --workspace planning --objective "Correct duration behavior"
+code-intelligence ui
 code-intelligence memory current --workspace planning
 code-intelligence memory pause --workspace planning
 code-intelligence memory activate planning-duration-correction --workspace planning
@@ -170,6 +170,11 @@ code-intelligence plan current --workspace planning
 ```
 
 Each work item stores schema-v2 `state.json`, curated `findings.md`, structured `spec.json`, immutable spec revisions, a human `spec.md`, a transaction journal, and optional `plan.json`. The old `task` CLI namespace remains a deprecated compatibility alias; there is no public MCP `task` tool.
+
+The control plane binds to `127.0.0.1:4317` by default. Its search and filters
+cover saved memories across workspaces; the agent sees only the selected active
+memory in its configured workspace. A workspace can intentionally have no
+active memory.
 
 ## Git behavior
 

@@ -1,4 +1,5 @@
-import { memoryRecordStatusSchema, structuredSpecSchema, taskNoteSchema, taskUpdateSchema, type MemoryRecordStatus, type StructuredSpec, type TaskNote, type TaskState, type TaskUpdate } from "./schemas.js";
+import { desiredRequirementInput, memoryRecordStatusSchema, structuredSpecSchema, taskNoteSchema, taskUpdateSchema, type MemoryRecordStatus, type StructuredSpec, type TaskNote, type TaskState, type TaskUpdate } from "./schemas.js";
+import { z } from "zod";
 import { TaskStorage } from "./storage.js";
 import { renderTaskContext, taskBootstrap } from "./context-renderer.js";
 import { slugify } from "../workspace/paths.js";
@@ -116,7 +117,7 @@ export class TaskService {
     const note = taskNoteSchema.parse(input);
     return this.storage.workspaceLock(workspaceId, async () => {
       const current = await this.current(workspaceId);
-      if (!current) throw new Error("No active memory");
+      if (!current) throw new Error("NO_ACTIVE_MEMORY: Memory selection is controlled by the operator in the local control plane.");
       const state: TaskState = structuredClone(current);
       for (const ref of note.evidence_refs) if (!state.inspected_refs.includes(ref)) throw new Error(`Evidence ref has not been inspected in this memory: ${ref}`);
       const now = new Date().toISOString();
@@ -175,7 +176,7 @@ export class TaskService {
     input: { summary: string; requirements: Array<{ statement: string; kind: "behavior" | "constraint"; priority: "must" | "should" }> }, reason?: string): Promise<StructuredSpec> {
     return this.storage.workspaceLock(workspaceId, async () => {
       const target = taskId ? await this.storage.read(workspaceId, taskId) : await this.current(workspaceId);
-      if (!target) throw new Error("No active memory");
+      if (!target) throw new Error("NO_ACTIVE_MEMORY: Memory selection is controlled by the operator in the local control plane.");
       const previous = await this.storage.readStructuredSpec(workspaceId, target.id);
       if (previous && !reason?.trim()) throw new Error("Replacing an existing specification requires a reason");
       const now = new Date().toISOString();
@@ -184,6 +185,45 @@ export class TaskService {
       await this.storage.transaction(workspaceId, target.id, "replace-specification", () => this.storage.writeStructuredSpec(workspaceId, target.id, spec),
         [`spec_revision_${spec.revision}`]);
       return spec;
+    });
+  }
+
+  async setSpec(workspaceId: string, input: { summary: string; requirements: z.input<typeof desiredRequirementInput>[] }) {
+    const desired = z.object({ summary: z.string().trim().min(1).max(50_000), requirements: z.array(desiredRequirementInput).min(1).max(500) }).strict().parse(input);
+    return this.storage.workspaceLock(workspaceId, async () => {
+      const target = await this.current(workspaceId);
+      if (!target) throw new Error("NO_ACTIVE_MEMORY: Memory selection is controlled by the operator in the local control plane.");
+      const previous = await this.storage.readStructuredSpec(workspaceId, target.id);
+      const existing = new Map(previous?.requirements.map((item) => [item.id, item]) || []);
+      const seen = new Set<string>();
+      let next = 1;
+      if (previous) for (let revision = 1; revision <= previous.revision; revision++) {
+        const historical = await this.storage.readSpecRevision(workspaceId, target.id, revision);
+        next = Math.max(next, ...historical.requirements.map((item) => Number(item.id.slice(1)) + 1));
+      }
+      const requirements = desired.requirements.map((item) => {
+        if (item.id) {
+          if (seen.has(item.id)) throw new Error(`Duplicate requirement: ${item.id}`);
+          if (!existing.has(item.id)) throw new Error(`Unknown requirement in active memory: ${item.id}`);
+          seen.add(item.id); return { ...item, id: item.id };
+        }
+        const id = `R${next++}`; seen.add(id); return { ...item, id };
+      });
+      const added = requirements.filter((item) => !existing.has(item.id)).map((item) => item.id);
+      const updated = requirements.filter((item) => {
+        const old = existing.get(item.id);
+        return old && (old.statement !== item.statement || old.kind !== item.kind || old.priority !== item.priority);
+      }).map((item) => item.id);
+      const removed = [...existing.keys()].filter((id) => !seen.has(id));
+      const changed = !previous || previous.summary !== desired.summary || added.length > 0 || updated.length > 0 || removed.length > 0
+        || JSON.stringify(previous.requirements.map((item) => item.id)) !== JSON.stringify(requirements.map((item) => item.id));
+      const diff = { added, updated, removed };
+      if (!changed && previous) return { spec: previous, revision: previous.revision, diff, changed: false };
+      const spec = structuredSpecSchema.parse({ revision: (previous?.revision || 0) + 1, summary: desired.summary, requirements,
+        reason: "Declarative specification update", created_at: new Date().toISOString() });
+      await this.storage.transaction(workspaceId, target.id, "set-specification", () => this.storage.writeStructuredSpec(workspaceId, target.id, spec),
+        [`spec_revision_${spec.revision}`]);
+      return { spec, revision: spec.revision, diff, changed: true };
     });
   }
 
@@ -227,7 +267,7 @@ export class TaskService {
   async resolve(workspaceId: string, recordId: string, status: MemoryRecordStatus, reason: string, evidenceRefs: string[] = []): Promise<TaskState> {
     const resolvedStatus = memoryRecordStatusSchema.parse(status);
     return this.storage.workspaceLock(workspaceId, async () => {
-      const state = await this.current(workspaceId); if (!state) throw new Error("No active memory");
+      const state = await this.current(workspaceId); if (!state) throw new Error("NO_ACTIVE_MEMORY: Memory selection is controlled by the operator in the local control plane.");
       const record = state.records.find((item) => item.id === recordId); if (!record) throw new Error(`Unknown memory record: ${recordId}`);
       const refs = [...new Set([...record.evidence_refs, ...evidenceRefs])];
       for (const ref of refs) if (!state.inspected_refs.includes(ref)) throw new Error(`Evidence ref has not been inspected in this memory: ${ref}`);
