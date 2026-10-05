@@ -14,6 +14,7 @@ import { findOpenCodeConfig, legacyDirectMcpNames } from "./integrations/opencod
 import { TaskStorage } from "./task-state/storage.js";
 import { SemanticIndex } from "./search/semantic.js";
 import { RepositoryAccessPolicy } from "./privacy/repository-access.js";
+import { structuralParserForPath } from "./symbols/parser.js";
 
 export interface DoctorCheck { name: string; status: "ok" | "warning" | "error"; detail: string; }
 
@@ -72,7 +73,10 @@ export async function doctor(fetcher: typeof fetch = fetch): Promise<DoctorCheck
       } catch { checks.push({ name: `repo:${workspace.id}/${repo.id}`, status: "error", detail: "Path, policy, or index is not readable" }); }
     }
   }
-  checks.push({ name: "symbol-backed-refs", status: "ok", detail: "Local structural symbol parser and location inference enabled" });
+  const structuralBackend = structuralParserForPath("probe.ts");
+  checks.push({ name: "symbol-backed-refs", status: structuralBackend === "ast-grep" ? "ok" : "warning",
+    detail: structuralBackend === "ast-grep" ? "ast-grep enabled for JavaScript/TypeScript; local fallback enabled for other languages"
+      : "ast-grep native binding unavailable; local fallback enabled" });
   checks.push({ name: "config-effects", status: config.limits.read_default_lines > 0 && config.privacy.store_raw_source === false ? "ok" : "error",
     detail: `read_default_lines=${config.limits.read_default_lines}; store_raw_source=${config.privacy.store_raw_source}` });
   for (const command of ["git", "rg"]) {
@@ -112,7 +116,7 @@ export async function doctor(fetcher: typeof fetch = fetch): Promise<DoctorCheck
   checks.push({ name: "opencode-plugin", status: plugin?.includes("CODE_INTELLIGENCE_MANAGED_PLUGIN") ? "ok" : "warning", detail: plugin ? "managed plugin check" : "not installed" });
   const heartbeat = await readTextIfExists(path.join(paths.dataDir, "guard-heartbeat.json"));
   let heartbeatFresh = false;
-  if (heartbeat) try { const value = JSON.parse(heartbeat) as { at?: string; version?: number }; heartbeatFresh = value.version === 2 && Boolean(value.at) && Date.now() - Date.parse(value.at!) < 300_000; } catch { /* warning below */ }
+  if (heartbeat) try { const value = JSON.parse(heartbeat) as { at?: string; version?: number; integration?: string }; heartbeatFresh = value.version === 2 && value.integration === "opencode" && Boolean(value.at) && Date.now() - Date.parse(value.at!) < 300_000; } catch { /* warning below */ }
   checks.push({ name: "opencode-guard", status: heartbeatFresh ? "ok" : "warning", detail: heartbeatFresh ? "functional heartbeat observed" : "no recent compatible guard heartbeat" });
   checks.push({ name: "query-logging", status: process.env.GRAPHIFY_QUERY_LOG_DISABLE === "1" || !config.graphify.enabled ? "ok" : "warning", detail: "Graphify child processes always force GRAPHIFY_QUERY_LOG_DISABLE=1" });
   return checks;

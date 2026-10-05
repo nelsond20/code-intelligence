@@ -40,7 +40,7 @@ async function run(): Promise<void> {
   if (command === "serve-mcp") return (await import("../mcp/server.js")).serveMcp();
   if (command === "integration" && subcommand === "heartbeat") {
     const workspace = workspaceFromArgs(); await atomicWrite(path.join(appPaths().dataDir, "guard-heartbeat.json"),
-      `${JSON.stringify({ version: 2, workspace, at: new Date().toISOString() })}\n`); return output({ recorded: true });
+      `${JSON.stringify({ version: 2, integration: "opencode", workspace, at: new Date().toISOString() })}\n`); return output({ recorded: true });
   }
   if (command === "doctor") { const checks = await doctor(); checks.forEach((check) => output(`${check.status.toUpperCase().padEnd(7)} ${check.name}: ${check.detail}`)); if (checks.some((c) => c.status === "error")) process.exitCode = 1; return; }
   if (command === "workspace") {

@@ -28,7 +28,7 @@ test("memory lifecycle, semantic notes, legacy migration, spec, and bounded comp
     const recorded = await restarted.current("planning");
     assert.deepEqual(recorded?.inspected_commits, [{ repo: "backend", commit: "abcdef1" }]);
     assert.equal(recorded?.active_hypotheses.length, 1, "mechanical inspection must not add semantic conclusions");
-    const compact = await restarted.context("planning", 200); assert.ok(compact.length <= 800); assert.doesNotMatch(compact, /Inspect rounding|Read tests/);
+    const compact = await restarted.context("planning", 200); assert.ok(compact.length <= 800); assert.doesNotMatch(compact, /Inspect rounding|Read tests|findings\.md|spec\.md/);
     await restarted.transition("planning", "paused"); assert.equal(await restarted.current("planning"), undefined);
     await restarted.activate("planning", first.id); await restarted.transition("planning", "completed");
     assert.equal((await restarted.list("planning"))[0]?.status, "completed");

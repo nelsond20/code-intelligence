@@ -8,10 +8,15 @@ import { PlanService } from "../plan/service.js";
 import type { ContextFindInput, ContextInspectInput, MemoryInput, PlanInput } from "./schemas.js";
 
 export class ToolRuntime {
+  clientName?: () => string | undefined;
   readonly registry = new WorkspaceRegistry();
   readonly tasks = new TaskService();
   readonly plans = new PlanService(undefined, this.tasks, this.registry);
   private brokerInstance?: Promise<ContextBroker>;
+
+  private planClient(): "opencode" | "unknown" {
+    return /opencode/i.test(this.clientName?.() || "") ? "opencode" : "unknown";
+  }
 
   async workspaceId(): Promise<string> {
     const configured = process.env.CODE_INTELLIGENCE_WORKSPACE?.trim();
@@ -55,7 +60,9 @@ export class ToolRuntime {
     if (input.action === "current") {
       const listed = await this.tasks.storage.listWithDiagnostics(workspaceId);
       const suspended_plans = (await Promise.all(listed.memories.map(withPlanStatus))).filter((item) => item.plan_status === "suspended");
-      return { ...(await this.tasks.bootstrap(workspaceId)), active_plan: await this.plans.current(workspaceId), suspended_plans };
+      const bootstrap = await this.tasks.bootstrap(workspaceId);
+      const memory = bootstrap.active && bootstrap.memory ? (({ findings_path: _findings, spec_path: _spec, ...publicMemory }) => publicMemory)(bootstrap.memory) : undefined;
+      return { active: bootstrap.active, ...(memory ? { memory } : {}), active_plan: await this.plans.current(workspaceId, this.planClient()), suspended_plans };
     }
     if (input.action === "list") { const listed = await this.tasks.storage.listWithDiagnostics(workspaceId); return {
       memories: await Promise.all(listed.memories.map(withPlanStatus)), corrupt_entries: listed.corrupt_entries }; }
@@ -70,9 +77,13 @@ export class ToolRuntime {
     if (input.action === "note") {
       const state = await this.tasks.note(workspaceId, { type: input.type, text: input.text, confidence: input.confidence,
         evidence_refs: input.evidence_refs, repo: input.repo, file: input.file, symbol: input.symbol });
-      return { saved: true, memory_id: state.id, note_type: input.type, updated_at: state.updated_at };
+      return { saved: true, memory_id: state.id, record_id: state.records[0]!.id, record_status: state.records[0]!.status, note_type: input.type, updated_at: state.updated_at };
     }
-    if (input.action === "resolve") return summary(await this.tasks.resolve(workspaceId, input.record_id, input.status, input.reason, input.evidence_refs));
+    if (input.action === "resolve") {
+      const state = await this.tasks.resolve(workspaceId, input.record_id, input.status, input.reason, input.evidence_refs);
+      const record = state.records.find((item) => item.id === input.record_id)!;
+      return { memory_id: state.id, record_id: record.id, record_status: record.status, evidence_refs: record.evidence_refs, updated_at: record.updated_at };
+    }
     if (input.action === "spec_replace") return this.tasks.replaceSpec(workspaceId, input.id, { summary: input.summary, requirements: input.requirements }, input.reason);
     if (input.action === "spec_patch") return this.tasks.patchSpec(workspaceId, input.id, input.reason, input.operations);
     if (input.action === "spec_rollback") return this.tasks.rollbackSpec(workspaceId, input.id, input.revision, input.reason);
@@ -81,13 +92,13 @@ export class ToolRuntime {
 
   async plan(input: PlanInput) {
     const workspaceId = await this.workspaceId();
-    if (input.action === "current") return this.plans.current(workspaceId);
-    if (input.action === "create") { await this.plans.create(workspaceId, input.steps, input.exceptions); return this.plans.current(workspaceId); }
+    if (input.action === "current") return this.plans.current(workspaceId, this.planClient());
+    if (input.action === "create") { await this.plans.create(workspaceId, input.steps, input.exceptions); return this.plans.current(workspaceId, this.planClient()); }
     if (input.action === "complete") return this.plans.complete(workspaceId);
-    if (input.action === "revise") { await this.plans.reviseOperations(workspaceId, input.reason, input.operations); return this.plans.current(workspaceId); }
-    if (input.action === "suspend") { await this.plans.transition(workspaceId, "suspended", input.reason); return this.plans.current(workspaceId); }
-    if (input.action === "reactivate") { await this.plans.transition(workspaceId, "active"); return this.plans.current(workspaceId); }
-    if (input.action === "abandon") { await this.plans.transition(workspaceId, "abandoned", input.reason); return this.plans.current(workspaceId); }
+    if (input.action === "revise") { await this.plans.reviseOperations(workspaceId, input.reason, input.operations); return this.plans.current(workspaceId, this.planClient()); }
+    if (input.action === "suspend") { await this.plans.transition(workspaceId, "suspended", input.reason); return this.plans.current(workspaceId, this.planClient()); }
+    if (input.action === "reactivate") { await this.plans.transition(workspaceId, "active"); return this.plans.current(workspaceId, this.planClient()); }
+    if (input.action === "abandon") { await this.plans.transition(workspaceId, "abandoned", input.reason); return this.plans.current(workspaceId, this.planClient()); }
     throw new Error(`Unsupported plan action: ${(input as { action: string }).action}`);
   }
 }

@@ -1,8 +1,8 @@
 import path from "node:path";
 import { realpath } from "node:fs/promises";
-import { RepositoryAccessPolicy } from "../privacy/repository-access.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { PlanService, verificationCommand } from "./service.js";
+import { canonicalTarget } from "./target-path.js";
 
 export interface GuardDecision { allowed: boolean; kind: "mutation" | "verification" | "other"; reason?: string; }
 
@@ -12,17 +12,11 @@ export class PlanGuard {
   private async identify(workspaceId: string, target: string): Promise<{ repo: string; path: string }> {
     const workspace = await this.registry.get(workspaceId);
     const absolute = path.resolve(target);
-    let canonical = absolute;
-    try { canonical = await realpath(absolute); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      canonical = path.join(await realpath(path.dirname(absolute)), path.basename(absolute));
-    }
     for (const repository of workspace.repositories) {
       const root = await realpath(repository.path);
-      const relative = path.relative(root, canonical);
-      const normalized = relative.replaceAll(path.sep, "/");
-      if (!relative.startsWith("..") && !path.isAbsolute(relative) && relative && (await RepositoryAccessPolicy.create(root)).canRead(normalized)) {
-        return { repo: repository.id, path: normalized };
+      const relative = path.relative(root, absolute);
+      if (relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+        return { repo: repository.id, path: await canonicalTarget(root, relative, true) };
       }
     }
     throw new Error(`Mutation target is outside registered repositories: ${target}`);

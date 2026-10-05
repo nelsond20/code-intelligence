@@ -14,7 +14,7 @@ import { languageForPath, parseSymbols } from "../symbols/parser.js";
 
 interface VectorMetadata { repo: string; path: string; start_line: number; end_line: number; hash: string; file_hash?: string; chunk_id?: string; symbol?: string; }
 interface StoredIndex { schema_version: 2; provider?: "ollama" | "llamacpp"; model: string; dimensions: number; vectors: number[][]; }
-interface IndexManifest { schema_version: 2; workspace: string; repo: string; root_fingerprint: string; generation: string; provider: string; model: string; dimensions: number; vectors: number; created_at: string; }
+interface IndexManifest { schema_version: 2; chunk_schema?: number; workspace: string; repo: string; root_fingerprint: string; generation: string; provider: string; model: string; dimensions: number; vectors: number; created_at: string; }
 export type Embedder = (texts: string[]) => Promise<number[][]>;
 export type IndexProgress =
   | { phase: "scanning" }
@@ -22,6 +22,7 @@ export type IndexProgress =
   | { phase: "complete"; completed: number; total: number; reused: number; files: number; elapsed_ms: number };
 export type IndexProgressCallback = (progress: IndexProgress) => void;
 const MAX_EMBEDDING_BATCH_TEXTS = 32;
+const CHUNK_SCHEMA = 3;
 
 function buildLlamaCppBatches(texts: string[], maxTexts: number, maxTokensEstimate: number): string[][] {
   const batches: string[][] = [];
@@ -124,7 +125,8 @@ export class SemanticIndex {
     const previousMetadata = force ? [] : await this.readMetadata(repository);
     const previousIndex = force ? undefined : await this.readVectors(repository);
     const previousProvider = previousIndex?.provider || "ollama";
-    const canReuse = previousIndex?.model === this.config.embeddings.model && previousProvider === this.config.embeddings.provider;
+    const canReuse = previousManifest?.chunk_schema === CHUNK_SCHEMA
+      && previousIndex?.model === this.config.embeddings.model && previousProvider === this.config.embeddings.provider;
     const metadataKey = (meta: VectorMetadata) => meta.chunk_id || `${meta.path}:${meta.start_line}:${meta.end_line}:${meta.hash}`;
     const reusable = new Map(previousMetadata.map((meta, index) => [metadataKey(meta), canReuse ? previousIndex?.vectors[index] : undefined]));
     const metadata: VectorMetadata[] = [];
@@ -137,7 +139,7 @@ export class SemanticIndex {
       if (source === undefined) continue;
       const fileHash = sourceHash(source);
       const occurrences = new Map<string, number>();
-      const symbols = parseSymbols(source);
+      const symbols = parseSymbols(source, relative);
       for (const chunk of chunkSource(source, 80, 12, symbols)) {
         const chunks = this.config.embeddings.provider === "llamacpp"
           ? splitEmbeddingChunk(chunk, Math.max(256, safeIndividualEmbeddingBudget(this.config.embeddings.batch_max_tokens_estimate) - 512))
@@ -185,7 +187,7 @@ export class SemanticIndex {
     await atomicWrite(next.metadata!, metadata.map((item) => JSON.stringify(item)).join("\n") + (metadata.length ? "\n" : ""));
     await atomicWrite(next.vectors!, JSON.stringify({ schema_version: 2, provider: this.config.embeddings.provider,
       model: this.config.embeddings.model, dimensions, vectors } satisfies StoredIndex));
-    await atomicWrite(base.manifest, `${JSON.stringify({ schema_version: 2, workspace: this.workspaceId, repo: repository.id,
+    await atomicWrite(base.manifest, `${JSON.stringify({ schema_version: 2, chunk_schema: CHUNK_SCHEMA, workspace: this.workspaceId, repo: repository.id,
       root_fingerprint: base.fingerprint, generation, provider: this.config.embeddings.provider, model: this.config.embeddings.model,
       dimensions, vectors: vectors.length, created_at: new Date().toISOString() } satisfies IndexManifest, null, 2)}\n`);
     onProgress?.({ phase: "complete", completed: pending.length, total: pending.length, reused,
@@ -198,6 +200,7 @@ export class SemanticIndex {
     if (!queryVector) throw new Error("Embedding provider returned no query vector");
     const scored: { metadata: VectorMetadata; score: number; repository: Repository }[] = [];
     for (const repository of repositories) {
+      if ((await this.manifest(repository))?.chunk_schema !== CHUNK_SCHEMA) continue;
       const metadata = await this.readMetadata(repository);
       const index = await this.readVectors(repository);
       if (!index) continue;
@@ -205,7 +208,8 @@ export class SemanticIndex {
       metadata.forEach((item, position) => scored.push({ metadata: item, score: cosine(queryVector, index.vectors[position] || []), repository }));
     }
     const output: SearchResult[] = [];
-    for (const item of scored.sort((a, b) => b.score - a.score).slice(0, limit)) {
+    for (const item of scored.sort((a, b) => b.score - a.score)) {
+      if (output.length >= limit) break;
       const policy = await RepositoryAccessPolicy.create(item.repository.path);
       if (!policy.canRead(item.metadata.path)) continue;
       const resolved = await policy.resolveFile(item.metadata.path);
@@ -222,6 +226,7 @@ export class SemanticIndex {
   async status(repository: Repository): Promise<"fresh" | "partial" | "stale" | "missing"> {
     const manifest = await this.manifest(repository);
     if (!manifest) return "missing";
+    if (manifest.chunk_schema !== CHUNK_SCHEMA) return "stale";
     const metadata = await this.readMetadata(repository); let stale = 0;
     const byFile = new Map<string, string>();
     for (const item of metadata) if (item.file_hash) byFile.set(item.path, item.file_hash);

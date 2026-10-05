@@ -51,7 +51,7 @@ export class CodeBackend implements ContextBackend {
     let symbol = parsed.symbol;
     if (!symbol) {
       const resolved = await (await RepositoryAccessPolicy.create(repository.path)).resolveFile(parsed.path);
-      symbol = containingSymbol(parseSymbols(await readFile(resolved.absolute, "utf8")), parsed.start || 1, parsed.end)?.qualified_name;
+      symbol = containingSymbol(parseSymbols(await readFile(resolved.absolute, "utf8"), parsed.path), parsed.start || 1, parsed.end)?.qualified_name;
     }
     if (!symbol) return { ref: request.ref, view, results: [], degraded: "No containing symbol could be inferred for this range" };
     return new SymbolService(config).relations(repository, symbol, view === "references" ? "references" : "dependencies", 1);

@@ -1,7 +1,8 @@
-// @ts-ignore -- declared runtime dependency; allows offline validation before npm installs the SDK.
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-// @ts-ignore -- declared runtime dependency; allows offline validation before npm installs the SDK.
+import { z, ZodError } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ToolRuntime } from "./runtime.js";
 import { registerPublicTools } from "./tools.js";
 
@@ -26,16 +27,105 @@ export function formatToolResponse(value: unknown) {
   else if (truncated && bounded && typeof bounded === "object" && !Array.isArray(bounded)) bounded = { ...(bounded as Record<string, unknown>), truncated: true };
   return { content: [{ type: "text" as const, text: JSON.stringify(bounded) }] };
 }
-function failure(error: unknown) { return { content: [{ type: "text" as const, text: JSON.stringify({ status: "error", code: "REQUEST_FAILED", message: (error as Error).message,
-  next_action: "Correct the reported input or inspect current memory/plan state and retry" }) }], isError: true }; }
-export function createMcpServer(runtime = new ToolRuntime()): McpServer {
-  const server = new McpServer({ name: "code-intelligence", version: "0.2.0" });
-  const register = (name: string, description: string, schema: any, handler: (input: any) => Promise<unknown>) => {
-    server.registerTool(name, { description, inputSchema: schema }, async (input: unknown) => {
-      try { return formatToolResponse(await handler(schema.parse(input))); } catch (error) { return failure(error); }
-    });
+
+function location(parts: Array<string | number>): string {
+  return parts.reduce<string>((result, part) => typeof part === "number" ? `${result}[${part}]` : result ? `${result}.${part}` : part, "") || "input";
+}
+
+function inputFailure(error: ZodError) {
+  const hints: Record<string, string> = {
+    requirementIds: "Use covers: [\"R1\"] on the step, write, or acceptance object.",
+    requirements_coverage: "Use covers: [\"R1\"] on the step, write, or acceptance object.",
+    criterion: "Use statement for acceptance text.",
+    body: "Use text for memory.note.",
+    tags: "Use repo, file, and symbol for record context; tags is unsupported.",
+    spec: "For spec_replace, put summary and requirements at the top level.",
   };
-  registerPublicTools(register, runtime);
+  const expanded = error.issues.flatMap((issue) => {
+    if (issue.code !== "invalid_union") return [issue];
+    const ranked = issue.unionErrors.map((branch) => branch.issues).sort((a, b) => {
+      const score = (items: typeof a) => items.reduce((total, item) => total + item.path.length + (item.code === "unrecognized_keys" ? 10 : 0), 0);
+      return score(b) - score(a);
+    });
+    return ranked[0] || [issue];
+  });
+  const issues = expanded.flatMap((issue) => {
+    if (issue.code === "unrecognized_keys") return issue.keys.map((key) => ({ path: location([...issue.path, key]), message: `Unknown field ${key}`, hint: hints[key] }));
+    if (issue.code === "invalid_union_discriminator") return [{ path: location(issue.path), message: `Invalid action; valid actions: ${issue.options.join(", ")}` }];
+    const path = location(issue.path);
+    const message = issue.code === "invalid_type" && issue.received === "undefined" ? `Required field ${path} is missing` : issue.message;
+    return [{ path, message }];
+  }).sort((a, b) => Number(b.message.startsWith("Unknown field")) - Number(a.message.startsWith("Unknown field")) || a.path.localeCompare(b.path));
+  const first = issues[0] || { path: "input", message: "Invalid input" };
+  return { status: "error", code: "INVALID_INPUT", message: `${first.message} at ${first.path}${"hint" in first && first.hint ? `. ${first.hint}` : ""}`, next_action: "Correct the reported fields and retry the same action",
+    diagnostics: { issues, state_unchanged: true } };
+}
+
+function failure(error: unknown) {
+  if (error instanceof ZodError) return { ...formatToolResponse(inputFailure(error)), isError: true };
+  const message = error instanceof Error ? error.message : "Request failed";
+  const code = /Unknown memory record/i.test(message) ? "RECORD_NOT_FOUND"
+    : /Unknown repository/i.test(message) ? "INVALID_INPUT"
+      : /coverage|covers|requirement.*test verification/i.test(message) ? "COVERAGE_GAP"
+    : /Evidence ref has not been inspected|requires inspected evidence/i.test(message) ? "EVIDENCE_NOT_INSPECTED"
+      : /Symlink escapes|Path escapes|excluded by repository|outside registered repositories|not authorized/i.test(message) ? "SECURITY_VIOLATION"
+        : /Verification|verification|writable path|cwd/i.test(message) ? "INVALID_VERIFICATION"
+          : /No active|active memory|already has|suspended|not terminal|requires a reason|confirmed spec|Unknown memory|Completed tasks/i.test(message) ? "INVALID_STATE" : "REQUEST_FAILED";
+  return { ...formatToolResponse({ status: "error", code, message: code === "REQUEST_FAILED" ? "Request failed; inspect current state and server diagnostics" : message,
+    next_action: "Correct the reported condition and retry; use memory.current or plan.current for current state" }), isError: true };
+}
+
+type PublicTool = { name: string; description: string; schema: z.ZodTypeAny; handler: (input: any) => Promise<unknown> };
+
+type SchemaField = Record<string, unknown>;
+type ActionBranch = { properties?: Record<string, SchemaField>; required?: string[] };
+
+export function publicInputSchema(schema: z.ZodTypeAny) {
+  const input = { ...zodToJsonSchema(schema), type: "object" as const };
+  const branches = (input as { anyOf?: ActionBranch[] }).anyOf;
+  if (!branches?.length || !branches.every((branch) => typeof branch.properties?.action?.const === "string")) return input;
+  const actions = branches.map((branch) => branch.properties!.action!.const as string);
+  const rootFields: Record<string, { field: SchemaField; actions: string[] }> = {};
+  for (const branch of branches) {
+    const action = branch.properties!.action!.const as string;
+    for (const [name, field] of Object.entries(branch.properties!)) {
+      if (name === "action") continue;
+      const existing = rootFields[name];
+      if (!existing) { rootFields[name] = { field, actions: [action] }; continue; }
+      existing.actions.push(action);
+      if (JSON.stringify(existing.field) !== JSON.stringify(field)) {
+        // Shared fields can have action-specific bounds. Keep the root projection
+        // permissive; the selected anyOf branch remains the exact validator.
+        existing.field = existing.field.type === field.type && typeof field.type === "string"
+          ? { type: field.type } : {};
+      }
+    }
+  }
+  const properties: Record<string, SchemaField> = { action: { type: "string", enum: actions,
+    description: actions.includes("spec_replace")
+      ? "Choose one listed action. Create the first structured spec with spec_replace; kind and priority belong inside each requirement."
+      : "Choose one listed action; see its branch for required fields." } };
+  for (const [name, { field, actions: fieldActions }] of Object.entries(rootFields)) {
+    properties[name] = { ...field, description: `${typeof field.description === "string" ? `${field.description} ` : ""}Used by ${fieldActions.join(", ")}; required only where its action branch says so.` };
+  }
+  return { ...input, properties,
+    required: ["action"] };
+}
+
+export function createMcpServer(runtime = new ToolRuntime()): Server {
+  const server = new Server({ name: "code-intelligence", version: "0.2.0" }, { capabilities: { tools: { listChanged: false } } });
+  runtime.clientName = () => server.getClientVersion()?.name;
+  const tools = new Map<string, PublicTool>();
+  registerPublicTools((name, description, schema, handler) => tools.set(name, { name, description, schema, handler }), runtime);
+  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [...tools.values()].map(({ name, description, schema }) => ({
+    name, description, inputSchema: publicInputSchema(schema),
+  })) }));
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const tool = tools.get(request.params.name);
+    if (!tool) return { ...formatToolResponse({ status: "error", code: "UNKNOWN_TOOL", message: "Unknown public tool", next_action: "Use a tool listed by tools/list" }), isError: true };
+    try { return formatToolResponse(await tool.handler(tool.schema.parse(request.params.arguments || {}))); }
+    catch (error) { return failure(error); }
+  });
   return server;
 }
 

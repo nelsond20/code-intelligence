@@ -19,7 +19,7 @@ test("child environment strips cloud credentials and forces privacy flags", () =
 });
 
 test("secret and binary paths are ignored", () => {
-  for (const file of [".env", ".env.local", "id_rsa", "credentials.json", "src/private.key", "node_modules/a.js", "image.png"]) assert.equal(isGloballyIgnored(file), true, file);
+  for (const file of [".env", ".env.local", "id_rsa", "credentials.json", "src/private.key", "node_modules/a.js", "image.png", ".ci-runtime/config.toml", "nested/.ci-runtime/data/state.json"]) assert.equal(isGloballyIgnored(file), true, file);
   assert.equal(isGloballyIgnored("src/service.ts"), false);
 });
 

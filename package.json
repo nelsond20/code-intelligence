@@ -23,7 +23,10 @@
     "lint": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/cli/main.js",
     "benchmark:prepare": "npm run build && node dist/scripts/benchmark.js prepare",
-    "benchmark:evaluate": "npm run build && node dist/scripts/benchmark.js evaluate"
+    "benchmark:evaluate": "npm run build && node dist/scripts/benchmark.js evaluate",
+    "model-facing:prepare": "npm run build && node dist/scripts/model-facing-eval.js prepare",
+    "model-facing:evaluate": "npm run build && node dist/scripts/model-facing-eval.js evaluate",
+    "model-facing:schema-diagnostic": "npm run build && node dist/scripts/model-facing-schema-diagnostic.js"
   },
   "engines": {
     "node": ">=22"
@@ -32,6 +35,7 @@
     "@ast-grep/napi": "^0.45.3",
     "@modelcontextprotocol/sdk": "^1.26.0",
     "jsonc-parser": "^3.3.1",
+    "zod-to-json-schema": "^3.25.1",
     "zod": "^3.25.76"
   },
   "devDependencies": {

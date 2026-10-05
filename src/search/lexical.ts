@@ -44,7 +44,7 @@ export async function lexicalSearch(repositories: Repository[], query: string, l
       const source = await readTextSource(path.join(repository.path, relative));
       if (source === undefined) continue;
       const lines = source.split(/\r?\n/);
-      const symbols = parseSymbols(source);
+      const symbols = parseSymbols(source, relative);
       let lastResult: SearchResult | undefined;
       for (let index = 0; index < lines.length; index++) {
         if (candidates && !candidates.get(relative)?.has(index + 1)) continue;

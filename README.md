@@ -1,5 +1,9 @@
 # Code Intelligence
 
+La documentación formal de la versión 0.2.0 empieza en
+[docs/README.md](docs/README.md). Incluye guía completa, referencia MCP,
+configuración, operación, limitaciones, benchmark y handoff.
+
 Code Intelligence is a local **Context Broker + Persistent Work Memory + Guarded Plan** for OpenCode and local models. It keeps durable work context across sessions and compactions, retrieves small relevant slices from multiple repositories, and presents exactly four MCP tools:
 
 - `context.find` discovers code, local documentation, vault knowledge, and Git history.
@@ -192,7 +196,7 @@ npm run benchmark:prepare
 
 Tests cover memory and plan restart, spec staleness, verification generations, PlanGuard interception, broker fail-open behavior, path/symlink boundaries, secret exclusion, Git safety, installer idempotence, privacy policy, and the exact four-tool MCP surface.
 
-The model benchmark is documented in [docs/BENCHMARK.md](docs/BENCHMARK.md).
+The model benchmark is documented in [docs/operations/BENCHMARK.md](docs/operations/BENCHMARK.md).
 Preparation creates isolated local fixtures but never invokes a model; endpoint
 access must be authorized separately.
 

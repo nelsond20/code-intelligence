@@ -137,6 +137,41 @@ test("plan paths reject unknown repositories, traversal, absolute and symlink es
     const accepted = await plans.create("planning", [{ ...base, writes, multi_file_justification: "One atomic generated contract update across three tightly coupled files." }]);
     assert.equal(accepted.steps[0]?.writes.length, 3);
     const symlinkMutation = await new PlanGuard(plans, registry).beforeMutation("planning", [path.join(repo, "src", "escape.ts")]);
-    assert.equal(symlinkMutation.allowed, false); assert.match(symlinkMutation.reason || "", /outside registered repositories/);
+    assert.equal(symlinkMutation.allowed, false); assert.match(symlinkMutation.reason || "", /Symlink escapes the repository/);
+  } finally { await env.cleanup(); }
+});
+
+test("future nested write paths resolve through safe ancestors and match guard targets", async () => {
+  const env = await isolated("plan-future-paths");
+  try {
+    const repo = path.join(env.root, "repo"); const outside = path.join(env.root, "outside");
+    await mkdir(path.join(repo, "src"), { recursive: true }); await mkdir(outside);
+    await symlink(outside, path.join(repo, "src", "escape"));
+    await symlink(path.join(repo, "src"), path.join(repo, "alias"));
+    await mkdir(path.join(repo, "src", "private"));
+    await symlink(path.join(repo, "src", "private"), path.join(repo, "public-alias"));
+    await writeFile(path.join(repo, "src", "file.ts"), "export const file = true;\n");
+    await writeFile(path.join(repo, ".codeintelligenceignore"), "src/private/**\n");
+    const registry = new WorkspaceRegistry(env.config, path.join(env.data, "workspaces")); await registry.add("planning", [repo]);
+    const taskStorage = new TaskStorage(path.join(env.data, "workspaces")); const tasks = new TaskService(taskStorage);
+    await tasks.create("planning", "Future path");
+    await tasks.replaceSpec("planning", undefined, { summary: "Add a bounded file", requirements: [{ statement: "New file is verified", kind: "behavior", priority: "must" }] });
+    const plans = new PlanService(new PlanStorage(taskStorage), tasks, registry);
+    const target = "src/new/deep/feature.ts";
+    const future = { kind: "implementation" as const, title: "Add file", objective: "Create one verified file", covers: ["R1"],
+      writes: [{ repo: "repo", path: target, covers: ["R1"] }], acceptance: [{ statement: "File verified", covers: ["R1"] }],
+      verification: [{ kind: "test" as const, program: "node", args: ["--test"], repo: "repo" }] };
+    await assert.rejects(plans.create("planning", [{ ...future, writes: [{ repo: "repo", path: "src/escape/deep/file.ts", covers: ["R1"] }] }]), /Symlink escapes/);
+    await assert.rejects(plans.create("planning", [{ ...future, writes: [{ repo: "repo", path: "src/private/deep/file.ts", covers: ["R1"] }] }]), /excluded/);
+    await assert.rejects(plans.create("planning", [{ ...future, writes: [{ repo: "repo", path: "public-alias/deep/file.ts", covers: ["R1"] }] }]), /excluded/);
+    await assert.rejects(plans.create("planning", [{ ...future, writes: [{ repo: "repo", path: "src/file.ts/deep/file.ts", covers: ["R1"] }] }]), /non-directory ancestor/);
+    await plans.create("planning", [future]);
+    const guard = new PlanGuard(plans, registry);
+    assert.equal((await guard.beforeMutation("planning", [path.join(repo, target)])).allowed, true);
+    assert.equal((await guard.beforeMutation("planning", [path.join(repo, "alias", "new", "deep", "feature.ts")])).allowed, true);
+    await mkdir(path.join(repo, "src", "new", "deep"), { recursive: true });
+    await writeFile(path.join(repo, target), "export const feature = true;\n");
+    assert.equal(await guard.afterMutation("planning", [path.join(repo, target)]), true);
+    const current = await plans.current("planning"); assert.deepEqual(current.step?.modified_paths, [{ repo: "repo", path: target }]);
   } finally { await env.cleanup(); }
 });

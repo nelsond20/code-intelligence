@@ -105,17 +105,20 @@ const shellCommand = (event) => typeof event.input?.command === "string" ? event
 const exitCode = (event) => event.result?.metadata?.exitCode ?? event.result?.metadata?.exit_code ?? event.result?.metadata?.exitStatus?.exitCode ??
   (event.result?.output?.ok === true ? 0 : event.result?.output?.ok === false ? 1 : undefined)
 
+const recordHeartbeat = (directory) => {
+  try {
+    const heartbeat = spawn("code-intelligence", ["integration", "heartbeat", "--workspace", "__CODE_INTELLIGENCE_WORKSPACE__"], {
+      cwd: directory, shell: false, stdio: "ignore", env: { ...process.env, NO_COLOR: "1" },
+    })
+    heartbeat.unref()
+  } catch { /* doctor will report a degraded guard */ }
+}
+
 export default {
   id: "code-intelligence",
 
   async setup(ctx) {
     try {
-      try {
-        const heartbeat = spawn("code-intelligence", ["integration", "heartbeat", "--workspace", "__CODE_INTELLIGENCE_WORKSPACE__"], {
-          cwd: ctx.location.directory, shell: false, stdio: "ignore", env: { ...process.env, NO_COLOR: "1" },
-        })
-        heartbeat.unref()
-      } catch { /* doctor will report a degraded guard */ }
       const registrations = []
       registrations.push(await ctx.session.hook("compaction", async (event) => {
         try {
@@ -138,8 +141,10 @@ export default {
       registrations.push(await ctx.tool.hook("execute.before", async (event) => {
         if (["edit", "write", "patch"].includes(event.tool)) {
           await runGuard(ctx.location.directory, "guard-before", { kind: "mutation", targets: mutationTargets(event) })
+          recordHeartbeat(ctx.location.directory)
         } else if (event.tool === "execute") {
           await runGuard(ctx.location.directory, "guard-before", { kind: "shell", command: shellCommand(event) })
+          recordHeartbeat(ctx.location.directory)
         }
       }))
       registrations.push(await ctx.tool.hook("execute.after", async (event) => {

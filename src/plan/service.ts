@@ -9,6 +9,7 @@ import { PlanStorage } from "./storage.js";
 import { appPaths } from "../workspace/paths.js";
 import { atomicWrite, readTextIfExists } from "../shared/fs.js";
 import { walkReadableFiles } from "../search/files.js";
+import { canonicalTarget } from "./target-path.js";
 
 function hashSpec(spec: string): string { return crypto.createHash("sha256").update(spec.trim()).digest("hex"); }
 function hasConfirmedSpec(spec: string): boolean {
@@ -47,12 +48,13 @@ async function contentHash(file: string): Promise<string | undefined> {
 export class PlanService {
   constructor(readonly storage = new PlanStorage(), readonly tasks = new TaskService(storage.tasks), readonly registry = new WorkspaceRegistry()) {}
 
-  private async guardStatus(workspaceId: string): Promise<"enforced" | "degraded" | "unavailable"> {
+  private async guardStatus(workspaceId: string, integration: "opencode" | "unknown"): Promise<"enforced" | "degraded" | "unavailable"> {
+    if (integration === "unknown") return "unavailable";
     const raw = await readTextIfExists(path.join(appPaths().dataDir, "guard-heartbeat.json"));
     if (!raw) return "unavailable";
     try {
-      const value = JSON.parse(raw) as { workspace?: string; at?: string; version?: number };
-      return value.workspace === workspaceId && value.version === 2 && value.at && Date.now() - Date.parse(value.at) < 300_000 ? "enforced" : "degraded";
+      const value = JSON.parse(raw) as { workspace?: string; at?: string; version?: number; integration?: string };
+      return value.workspace === workspaceId && value.integration === integration && value.version === 2 && value.at && Date.now() - Date.parse(value.at) < 300_000 ? "enforced" : "degraded";
     } catch { return "degraded"; }
   }
 
@@ -85,18 +87,18 @@ export class PlanService {
     const exceptionIds = new Set(exceptions.map((item) => item.requirement_id));
     for (const exception of exceptions) if (!requirements.has(exception.requirement_id)) throw new Error(`Exception references unknown requirement ${exception.requirement_id}`);
     const covered = new Set<string>();
-    for (const step of steps) {
+    for (const [stepIndex, step] of steps.entries()) {
       for (const requirement of step.covers) {
         if (!requirements.has(requirement)) throw new Error(`Step ${step.id} covers unknown requirement ${requirement}`);
         covered.add(requirement);
       }
-      if (step.covers.length === 0) throw new Error(`Step ${step.id} does not cover a requirement`);
-      for (const write of step.writes) {
-        if (write.covers.length === 0) throw new Error(`Write ${write.repo}:${write.path} has no requirement coverage`);
+      if (step.covers.length === 0) throw new Error(`Step ${step.id} does not cover a requirement at steps[${stepIndex}].covers; use covers with R* IDs from the active spec: ${[...requirements.keys()].join(", ")}`);
+      for (const [writeIndex, write] of step.writes.entries()) {
+        if (write.covers.length === 0) throw new Error(`Write ${write.repo}:${write.path} has no requirement coverage at steps[${stepIndex}].writes[${writeIndex}].covers; use a subset of step covers: ${step.covers.join(", ")}`);
         for (const requirement of write.covers) if (!step.covers.includes(requirement)) throw new Error(`Write ${write.repo}:${write.path} covers ${requirement} outside step ${step.id}`);
       }
-      for (const acceptance of step.acceptance) {
-        if (!acceptance.covers.length) throw new Error(`Step ${step.id} has an acceptance criterion without requirement coverage`);
+      for (const [acceptanceIndex, acceptance] of step.acceptance.entries()) {
+        if (!acceptance.covers.length) throw new Error(`Step ${step.id} has an acceptance criterion without requirement coverage at steps[${stepIndex}].acceptance[${acceptanceIndex}].covers; use an object with statement and covers (legacy strings cannot cover a structured spec). Expected a subset of: ${step.covers.join(", ")}`);
         for (const requirement of acceptance.covers) if (!step.covers.includes(requirement)) throw new Error(`Acceptance ${acceptance.id} covers ${requirement} outside step ${step.id}`);
         if (!acceptance.verification_ids.length) throw new Error(`Acceptance ${acceptance.id} has no verification`);
         for (const verificationId of acceptance.verification_ids) if (!step.verification.some((item) => item.id === verificationId)) throw new Error(`Acceptance ${acceptance.id} references unknown verification ${verificationId}`);
@@ -107,33 +109,14 @@ export class PlanService {
     const behavior = spec.requirements.filter((item) => item.kind === "behavior" && item.priority === "must" && covered.has(item.id));
     for (const requirement of behavior) {
       if (!steps.some((step) => step.covers.includes(requirement.id) && step.verification.some((verification) => verification.kind === "test"))) {
-        throw new Error(`Behavior requirement ${requirement.id} requires a test verification`);
+        throw new Error(`Behavior requirement ${requirement.id} requires a test verification; add verification with kind: "test" to a step whose covers includes ${requirement.id}`);
       }
     }
   }
 
-  private async canonicalPath(workspaceId: string, repo: string, requested: string): Promise<string> {
-    if (path.isAbsolute(requested)) throw new Error(`Absolute writable paths are not allowed: ${requested}`);
-    const normalized = path.posix.normalize(requested.replaceAll("\\", "/"));
-    if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) throw new Error(`Path escapes the repository: ${requested}`);
+  private async canonicalPath(workspaceId: string, repo: string, requested: string, allowMissing = true): Promise<string> {
     const repository = await this.registry.resolveRepository(workspaceId, repo);
-    const policy = await RepositoryAccessPolicy.create(repository.path);
-    policy.assertReadable(normalized);
-    const root = await realpath(repository.path); const candidate = path.resolve(root, normalized);
-    const relative = path.relative(root, candidate);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(`Path escapes the repository: ${requested}`);
-    try {
-      const canonical = await realpath(candidate); const canonicalRelative = path.relative(root, canonical);
-      if (canonicalRelative.startsWith("..") || path.isAbsolute(canonicalRelative)) throw new Error(`Symlink escapes the repository: ${requested}`);
-      if (!(await stat(canonical)).isFile()) throw new Error(`Writable path is not a regular file: ${requested}`);
-      return canonicalRelative.replaceAll(path.sep, "/");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const parent = await realpath(path.dirname(candidate));
-      const parentRelative = path.relative(root, parent);
-      if (parentRelative.startsWith("..") || path.isAbsolute(parentRelative)) throw new Error(`Symlink escapes the repository: ${requested}`);
-      return relative.replaceAll(path.sep, "/");
-    }
+    return canonicalTarget(repository.path, requested, allowMissing);
   }
 
   private async normalizeStep(workspaceId: string, input: PlanStepInput, status: PlanStep["status"], assignedId?: string): Promise<PlanStep> {
@@ -143,17 +126,41 @@ export class PlanService {
     const writes = await Promise.all(parsed.writes.map(async (item) => ({ ...item, repo: item.repo, path: await this.canonicalPath(workspaceId, item.repo, item.path) })));
     const unique = new Set(writes.map((item) => `${item.repo}:${item.path}`));
     if (unique.size !== writes.length) throw new Error(`Step ${id} contains duplicate writable paths`);
-    const context = await Promise.all(parsed.context.map(async (item) => ({ ...item, file: await this.canonicalPath(workspaceId, item.repo, item.file) })));
+    const context = await Promise.all(parsed.context.map(async (item) => ({ ...item, file: await this.canonicalPath(workspaceId, item.repo, item.file, false) })));
     const seen = new Set<string>();
-    const verification = parsed.verification.map((item, index) => {
-      validateVerification(item); const command = verificationCommand(item);
-      if (seen.has(command)) throw new Error(`Step ${id} contains duplicate verification: ${command}`);
-      seen.add(command); return { ...item, id: `V${index + 1}` };
-    });
+    const verification: Array<(typeof parsed.verification)[number] & { id: string }> = [];
+    for (const [index, item] of parsed.verification.entries()) {
+      try { validateVerification(item); }
+      catch (error) { throw new Error(`Step ${id} verification[${index}]: ${(error as Error).message}`); }
+      const command = verificationCommand(item);
+      if (seen.has(command)) throw new Error(`Step ${id} contains duplicate verification at verification[${index}]`);
+      seen.add(command);
+      if (item.repo) {
+        try { await this.registry.resolveRepository(workspaceId, item.repo); }
+        catch { throw new Error(`Step ${id} verification[${index}].repo is not registered`); }
+      }
+      if (item.cwd !== undefined) {
+        if (!item.repo) throw new Error(`Step ${id} verification[${index}].cwd requires a registered repo`);
+        if (path.isAbsolute(item.cwd) || item.cwd.split(/[\\/]/).includes("..")) throw new Error(`Step ${id} verification[${index}].cwd must stay inside its repo`);
+        const repository = await this.registry.resolveRepository(workspaceId, item.repo);
+        const root = await realpath(repository.path);
+        let directory: string;
+        try { directory = await realpath(path.resolve(root, item.cwd)); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Step ${id} verification[${index}].cwd does not exist`);
+          throw error;
+        }
+        const relative = path.relative(root, directory);
+        if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(`Step ${id} verification[${index}].cwd escapes its repo`);
+        if (!(await stat(directory)).isDirectory()) throw new Error(`Step ${id} verification[${index}].cwd is not a directory`);
+        if (relative) (await RepositoryAccessPolicy.create(root)).assertReadable(relative.replaceAll(path.sep, "/"));
+      }
+      verification.push({ ...item, id: `V${index + 1}` });
+    }
     const acceptance = parsed.acceptance.map((item, index) => {
       const value = typeof item === "string" ? { statement: item, covers: [] as string[], verified_by: [] as number[] } : item;
       const positions = value.verified_by.length ? value.verified_by : verification.map((_, verificationIndex) => verificationIndex + 1);
-      for (const position of positions) if (!verification[position - 1]) throw new Error(`Acceptance A${index + 1} references missing verification position ${position}`);
+      for (const position of positions) if (!verification[position - 1]) throw new Error(`Acceptance A${index + 1} references missing verification position ${position} at acceptance[${index}].verified_by; positions are 1-based`);
       return { id: `A${index + 1}`, statement: value.statement, covers: value.covers, verification_ids: [...new Set(positions.map((position) => verification[position - 1]!.id!))] };
     });
     return { ...parsed, id, writes, context, acceptance, status, mutation_generation: 0, modified_paths: [], violations: [], verification };
@@ -187,12 +194,12 @@ export class PlanService {
     return { plan, stale: hashSpec(spec) !== plan.spec_hash };
   }
 
-  async current(workspaceId: string) {
+  async current(workspaceId: string, integration: "opencode" | "unknown" = "opencode") {
     const { plan, stale } = await this.state(workspaceId); if (!plan) return { active: false as const };
     if (plan.status === "completed" || plan.status === "abandoned") return { active: false as const, completed: plan.status === "completed", abandoned: plan.status === "abandoned", revision: plan.revision };
     const step = plan.steps[plan.current_step]!;
-    return { active: (plan.status === "active") as boolean, status: plan.status, guard_status: plan.status === "active" ? await this.guardStatus(workspaceId) : "unavailable", stale, revision: plan.revision, position: plan.current_step + 1, total: plan.steps.length,
-      step: { id: step.id, title: step.title, objective: step.objective, writes: step.writes, context: step.context,
+    return { active: (plan.status === "active") as boolean, status: plan.status, guard_status: plan.status === "active" ? await this.guardStatus(workspaceId, integration) : "unavailable", stale, revision: plan.revision, position: plan.current_step + 1, total: plan.steps.length,
+      step: { id: step.id, kind: step.kind, title: step.title, objective: step.objective, covers: step.covers, writes: step.writes, context: step.context,
         acceptance: step.acceptance, verification: step.verification.map((verification) => ({ id: verification.id, command: verificationCommand(verification), expect_exit: verification.expect_exit, current: verification.verified_generation === step.mutation_generation })),
         mutation_generation: step.mutation_generation, modified_paths: step.modified_paths } };
   }
