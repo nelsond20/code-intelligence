@@ -86,6 +86,22 @@ function requirementContract(root: JsonObject | undefined) {
   };
 }
 
+function planContract(root: JsonObject | undefined) {
+  const step = object(field(root, "properties", "steps", "items"));
+  const verification = object(field(root, "properties", "steps", "items", "properties", "verification", "items"));
+  const write = object(field(root, "properties", "steps", "items", "properties", "writes", "items"));
+  return {
+    actions: field(root, "properties", "action", "enum"),
+    step_required: step?.required,
+    kinds: field(step, "properties", "kind", "enum"),
+    acceptance_type: field(step, "properties", "acceptance", "items", "type"),
+    verification_required: verification?.required,
+    verification_kinds: field(verification, "properties", "kind", "enum"),
+    write_required: write?.required,
+    revise_step_present: field(root, "properties", "step") !== undefined,
+  };
+}
+
 function summarize(tool: DiagnosticTool | undefined, name: "memory" | "plan") {
   const root = tool?.schema;
   const critical = name === "memory"
@@ -97,7 +113,8 @@ function summarize(tool: DiagnosticTool | undefined, name: "memory" | "plan") {
     description_length: tool?.description?.length ?? null,
     root_properties: Object.keys(object(root?.properties) || {}), root_required: Array.isArray(root?.required) ? root.required : [],
     missing_critical_fields: critical.filter((key) => field(root, ...key.split(".")) === undefined),
-    ...(name === "memory" ? { requirement_contract: requirementContract(root) } : {}) };
+    requirement_contract: name === "memory" ? requirementContract(root) : undefined,
+    plan_contract: name === "plan" ? planContract(root) : undefined };
 }
 
 export function compareToolSchemas(server: DiagnosticTool[], toolSearch?: DiagnosticTool[], initial?: DiagnosticTool[]) {
@@ -113,6 +130,8 @@ export function compareToolSchemas(server: DiagnosticTool[], toolSearch?: Diagno
       tool_search_description_equals_tools_list: searched ? hash(searched.description) === hash(listed.description) : null,
       initial_equals_tools_list: before?.schema ? hash(before.schema) === hash(listed.schema) : null,
       initial_description_equals_tools_list: initialDescriptionMatches,
+      ...(name === "plan" ? { initial_plan_contract_preserved: Boolean(before?.schema && initialDescriptionMatches === true
+        && hash(planContract(before.schema)) === hash(planContract(listed.schema))) } : {}),
       ...(name === "memory" ? { initial_schema_differences: initialDifferences,
         initial_spec_set_contract_preserved: before?.schema && initialDescriptionMatches === true
           ? initialDifferences?.every((difference) => difference.category === "B") === true : false } : {}),
@@ -152,7 +171,8 @@ async function main(args: string[]): Promise<void> {
   if (requireMatch && result.some((tool) =>
     Boolean(exportPath) && differs(tool.tool_search.observed, tool.tool_search_equals_tools_list,
       tool.tool_search_description_equals_tools_list, tool.tool === "memory") ||
-    Boolean(initialPath) && tool.tool === "memory" && tool.initial_spec_set_contract_preserved !== true)) process.exitCode = 1;
+    Boolean(initialPath) && (tool.tool === "memory" && tool.initial_spec_set_contract_preserved !== true
+      || tool.tool === "plan" && tool.initial_plan_contract_preserved !== true))) process.exitCode = 1;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

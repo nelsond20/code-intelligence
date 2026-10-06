@@ -23,10 +23,18 @@ export class PlanGuard {
   }
 
   async beforeMutation(workspaceId: string, targets: string[]): Promise<GuardDecision> {
-    const { plan, stale } = await this.plans.state(workspaceId); if (!plan) return { allowed: true, kind: "mutation" };
+    const { plan, stale } = await this.plans.state(workspaceId);
+    if (!plan || ["completed", "abandoned"].includes(plan.status)) {
+      const memory = await this.plans.tasks.current(workspaceId);
+      if (memory && await this.plans.storage.tasks.readStructuredSpec(workspaceId, memory.id))
+        return { allowed: false, kind: "mutation", reason: "PLAN_REQUIRED: Create the persistent Code Intelligence plan before modifying workspace files." };
+      return { allowed: true, kind: "mutation" };
+    }
     if (plan.status === "suspended") return { allowed: false, kind: "mutation", reason: "The current memory has a suspended plan; reactivate or abandon it before mutating files" };
+    if (plan.status === "final_review") return { allowed: false, kind: "mutation", reason: "The plan is in final review; use operator controls to resolve findings before further writes" };
     if (plan.status !== "active") return { allowed: true, kind: "mutation" };
-    if (stale) return { allowed: false, kind: "mutation", reason: "Active plan is stale because the confirmed spec changed" };
+    if (stale) return { allowed: false, kind: "mutation", reason: "PLAN_STALE: Active plan is stale because the structured spec changed" };
+    if (plan.steps[plan.current_step]?.status !== "current") return { allowed: false, kind: "mutation", reason: "No valid current plan step authorizes workspace mutation" };
     if (!targets.length) return { allowed: false, kind: "mutation", reason: "Mutation target could not be determined" };
     const allowed = new Set(plan.steps[plan.current_step]!.writes.map((item) => `${item.repo}:${item.path}`));
     try {
@@ -39,11 +47,21 @@ export class PlanGuard {
   }
 
   async beforeShell(workspaceId: string, command: string): Promise<GuardDecision> {
-    const { plan, stale } = await this.plans.state(workspaceId); if (!plan) return { allowed: true, kind: "other" };
-    if (plan.status === "suspended") return { allowed: false, kind: "other", reason: "The current memory has a suspended plan; reactivate or abandon it before executing commands" };
-    if (plan.status !== "active") return { allowed: true, kind: "other" };
-    const step = plan.steps[plan.current_step]!;
     const mutation = /(^|[;&|]\s*)(rm|mv|cp|install|touch|truncate|tee|sed\s+-[^\n]*i|perl\s+-[^\n]*i|python(?:3)?\b[^\n]*(?:write|unlink|rename)|node\b[^\n]*(?:writeFile|unlink|rename))\b|(^|[^>])>{1,2}(?!>)|\b(?:writeFile|appendFile|writeTextFile|unlink|rename|rmSync|Bun\.write)\s*\(/i;
+    const { plan, stale } = await this.plans.state(workspaceId);
+    if (!plan || ["completed", "abandoned"].includes(plan.status)) {
+      const memory = await this.plans.tasks.current(workspaceId);
+      if (mutation.test(command) && memory && await this.plans.storage.tasks.readStructuredSpec(workspaceId, memory.id))
+        return { allowed: false, kind: "mutation", reason: "PLAN_REQUIRED: Create the persistent Code Intelligence plan before modifying workspace files." };
+      return { allowed: true, kind: "other" };
+    }
+    if (plan.status === "suspended") return { allowed: false, kind: "other", reason: "The current memory has a suspended plan; reactivate or abandon it before executing commands" };
+    if (plan.status === "final_review") return mutation.test(command)
+      ? { allowed: false, kind: "mutation", reason: "The plan is in final review; writes require operator resolution" }
+      : { allowed: true, kind: "other" };
+    if (plan.status !== "active") return { allowed: true, kind: "other" };
+    const step = plan.steps[plan.current_step];
+    if (!step || step.status !== "current") return { allowed: false, kind: "other", reason: "No valid current plan step authorizes workspace commands" };
     if (mutation.test(command)) return { allowed: false, kind: "mutation", reason: stale
       ? "Active plan is stale because the confirmed spec changed"
       : "Detectable shell-based file mutation is blocked while a guarded plan is active" };

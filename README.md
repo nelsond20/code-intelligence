@@ -156,7 +156,9 @@ For Ornith, use context `90112` and output `8192`. This project does not change 
 
 ## Typical workflow
 
-For substantial work, use `code-intelligence ui` to create and select the active memory. The agent can call `memory(action="current")`, record durable meaning with `memory(action="note")`, resolve records by server ID, and declare the complete desired structured specification with `memory(action="spec_set")`. For guarded work, create a coverage-checked plan, call `plan(action="current")`, work only in the current write set, verify it, and request `plan(action="complete")`. Use structured `plan(action="revise")` operations instead of silently deviating; suspend/reactivate/abandon are explicit lifecycle transitions.
+For substantial work, use `code-intelligence ui` to create and select the active memory. The agent can call `memory(action="current")`, record durable meaning with `memory(action="note")`, resolve records by server ID, and declare the complete desired structured specification with `memory(action="spec_set")`. For guarded work, create a coverage-checked plan, call `plan(action="current")`, work only in the current write set, verify it, and request `plan(action="complete_current")`. Use `plan(action="revise_current")` for the current step. The localhost UI owns suspend/reactivate/abandon and final completion requires a cumulative `code-review-and-quality` receipt; Qwen 0.24.7 currently exposes no verifiable review result, so the gate remains hard.
+
+The UI also provides Archive, Restore, and Delete for memories, notes, specifications, and plans. Archive hides an item in the default UI view and can be reversed; deleting removes its stored data. The [user guide](docs/product/USER_GUIDE.md) explains the dependencies and restore views.
 
 Memory lifecycle from the CLI:
 

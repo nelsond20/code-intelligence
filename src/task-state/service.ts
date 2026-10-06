@@ -3,6 +3,10 @@ import { z } from "zod";
 import { TaskStorage } from "./storage.js";
 import { renderTaskContext, taskBootstrap } from "./context-renderer.js";
 import { slugify } from "../workspace/paths.js";
+import { planStateSchema } from "../plan/schemas.js";
+import { planBindingStale } from "../plan/binding.js";
+import { reviewReceiptCurrent } from "../plan/review-state.js";
+import { WorkspaceRegistry } from "../workspace/registry.js";
 
 function uniquePush(values: string[], value: string, max = 50): string[] {
   return [value, ...values.filter((item) => item !== value)].slice(0, max);
@@ -13,7 +17,7 @@ export class TaskService {
 
   async list(workspaceId: string): Promise<TaskState[]> { return this.storage.list(workspaceId); }
   async current(workspaceId: string): Promise<TaskState | undefined> {
-    return (await this.list(workspaceId)).find((task) => task.status === "active");
+    return (await this.list(workspaceId)).find((task) => task.status === "active" && !task.archived_at);
   }
 
   async bootstrap(workspaceId: string) {
@@ -58,6 +62,7 @@ export class TaskService {
       const tasks = await this.list(workspaceId);
       const target = tasks.find((task) => task.id === taskId);
       if (!target) throw new Error(`Unknown memory: ${taskId}`);
+      if (target.archived_at) throw new Error("Restore this archived memory before activating it");
       if (target.status === "completed") throw new Error("Completed tasks cannot be activated; update their status is intentionally unsupported");
       for (const task of tasks.filter((item) => item.status === "active" && item.id !== target.id)) await this.assertMayLeave(workspaceId, task);
       await this.pauseActive(workspaceId, tasks);
@@ -123,10 +128,12 @@ export class TaskService {
       const now = new Date().toISOString();
       const recordKind = note.type === "hypothesis_rejected" ? "hypothesis" : note.type;
       if (note.type === "hypothesis_rejected") throw new Error("Reject hypotheses with memory.resolve and the server-owned record id");
-      const record = { id: `M${state.records.length + 1}`, kind: recordKind, text: note.text,
+      const nextRecordId = state.next_record_id || Math.max(0, ...state.records.map((item) => Number(item.id.slice(1)) || 0)) + 1;
+      const record = { id: `M${nextRecordId}`, kind: recordKind, text: note.text,
         status: note.evidence_refs.length ? "supported" as const : "observed" as const, confidence: note.confidence,
         evidence_refs: note.evidence_refs, repo: note.repo, file: note.file, symbol: note.symbol, created_at: now, updated_at: now };
       state.records.unshift(record);
+      state.next_record_id = nextRecordId + 1;
       const detail = [note.repo && `repo=${note.repo}`, note.file && `file=${note.file}`, note.symbol && `symbol=${note.symbol}`].filter(Boolean).join(", ");
       const heading = note.type.replaceAll("_", " ").replace(/^./, (v) => v.toUpperCase());
       if ((note.type === "observation" || note.type === "evidence" || note.type === "decision") && note.evidence_refs.length) state.confirmed_findings = uniquePush(state.confirmed_findings, note.text);
@@ -307,6 +314,17 @@ export class TaskService {
 
   private async assertMayLeave(workspaceId: string, memory: TaskState, completing = false): Promise<void> {
     const status = await this.planStatus(workspaceId, memory.id);
+    if (completing && status && status !== "completed") throw new Error(`PLAN_REVIEW_REQUIRED: Memory ${memory.id} cannot complete until its plan and final review are completed`);
+    if (completing && status === "completed") {
+      const raw = await this.storage.readPlan(workspaceId, memory.id);
+      const plan = raw ? planStateSchema.parse(JSON.parse(raw)) : undefined;
+      if (plan && await planBindingStale(this.storage, workspaceId, plan)) {
+        throw new Error(`PLAN_STALE: Memory ${memory.id} is bound to an older specification`);
+      }
+      if (plan && !(await reviewReceiptCurrent(workspaceId, plan, new WorkspaceRegistry()))) {
+        throw new Error(`PLAN_REVIEW_REQUIRED: Memory ${memory.id} needs a current cumulative code-review-and-quality receipt`);
+      }
+    }
     if (status === "active" || status === "final_review") throw new Error(`Memory ${memory.id} has an ${status} plan; suspend, complete, or abandon the plan first`);
     if (completing && status === "suspended") throw new Error(`Memory ${memory.id} has a suspended plan; complete or abandon the plan first`);
   }

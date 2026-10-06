@@ -45,6 +45,16 @@ test("schema diagnostic distinguishes published, searched, and unobserved initia
     assert.equal(initialOnly.tool_search_equals_tools_list, null);
     assert.equal(initialOnly.initial_equals_tools_list, false);
     assert.equal(compareToolSchemas(serverTools, undefined, projected).find((item) => item.tool === "plan")!.initial.observed, false);
+    const planTool = listed.find((tool) => tool.name === "plan")!;
+    const planSchema = structuredClone(planTool.inputSchema) as Record<string, any>;
+    delete planSchema.$schema;
+    const planInitial = parseInitialTools({ tools: [{ name: "mcp__code-intelligence__plan", description: planTool.description,
+      parametersJsonSchema: planSchema }] });
+    const planResult = compareToolSchemas(serverTools, undefined, planInitial).find((item) => item.tool === "plan")!;
+    assert.equal(planResult.initial_equals_tools_list, false);
+    assert.equal(planResult.initial_plan_contract_preserved, true);
+    delete planSchema.properties.steps.items.properties.acceptance.items.type;
+    assert.equal(compareToolSchemas(serverTools, undefined, planInitial).find((item) => item.tool === "plan")!.initial_plan_contract_preserved, false);
     assert.ok(compareToolSchemas(serverTools, searched).every((item) => item.initial.observed === false && item.initial_equals_tools_list === null));
     const normalized = structuredClone(listed.find((tool) => tool.name === "memory")!.inputSchema) as Record<string, any>;
     delete normalized.$schema;

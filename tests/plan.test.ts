@@ -19,18 +19,24 @@ const step = (id: string, repo: string, file: string, command: string) => ({
   verification: [{ command, expect_exit: 0 }],
 });
 
+const compactStep = (repo: string, file: string, command: string) => ({
+  kind: "implementation" as const, title: "Implement change", objective: "Complete bounded behavior", covers: ["R1"],
+  writes: [{ repo, path: file }], acceptance: ["Behavior is correct"],
+  verification: [{ kind: "test" as const, program: "npm", args: command.split(" ").slice(1), repo }],
+});
+
 test("plan requires active memory and confirmed spec, binds the hash internally, and survives restart", async () => {
   const original = process.env.CODE_INTELLIGENCE_WORKSPACE; const env = await fixtureWorkspace("plan-lifecycle");
   try {
-    const runtime = new ToolRuntime(); const steps = [step("S1", "backend", "src/PlanningService.ts", "npm test -- backend"), step("S2", "shared", "src/duration.ts", "npm test -- shared")];
-    await assert.rejects(runtime.plan({ action: "create", steps }), /active memory/);
+    const runtime = new ToolRuntime(); const steps = [compactStep("backend", "src/PlanningService.ts", "npm test -- backend"), compactStep("shared", "src/duration.ts", "npm test -- shared")];
+    await assert.rejects(runtime.plan({ action: "create", steps }), /NO_ACTIVE_MEMORY/);
     await runtime.tasks.create("planning", "Duration work");
-    await assert.rejects(runtime.plan({ action: "create", steps }), /confirmed spec/);
-    await runtime.tasks.update("planning", undefined, { spec: "Duration calculations preserve existing behavior." });
+    await assert.rejects(runtime.plan({ action: "create", steps }), /SPEC_REQUIRED/);
+    await runtime.tasks.setSpec("planning", { summary: "Duration calculations", requirements: [{ statement: "Preserve duration behavior", kind: "behavior", priority: "must" }] });
     const created = await runtime.plan({ action: "create", steps }) as any;
     assert.equal(created.active, true); assert.equal(created.step.id, "S1"); assert.equal(created.total, 2);
-    assert.deepEqual(created.step.acceptance[0], { id: "A1", statement: "S1 behavior is correct", covers: ["R1"], verification_ids: ["V1"] });
-    assert.doesNotMatch(JSON.stringify(created), /S2 behavior|npm test -- shared/);
+    assert.deepEqual(created.step.acceptance[0], { id: "A1", statement: "Behavior is correct", covers: ["R1"], verification_ids: ["V1"] });
+    assert.doesNotMatch(JSON.stringify(created), /npm test -- shared/);
     const state = await runtime.plans.state("planning"); assert.match(state.plan?.spec_hash || "", /^[a-f0-9]{64}$/);
     const restarted = new ToolRuntime(); const resumed = await restarted.plan({ action: "current" }) as any;
     assert.equal(resumed.active, true); assert.equal(resumed.step.id, "S1");
@@ -45,9 +51,9 @@ test("PlanGuard enforces current scope, generations, verification freshness, adv
   const editedFile = fixture("backend/src/PlanningService.ts"); const originalSource = await readFile(editedFile, "utf8");
   try {
     const runtime = new ToolRuntime(); await runtime.tasks.create("planning", "Guarded duration");
-    await runtime.tasks.update("planning", undefined, { spec: "Implement and verify duration changes." });
-    const first = step("S1", "backend", "src/PlanningService.ts", "npm test -- backend");
-    const second = step("S2", "shared", "src/duration.ts", "npm test -- shared");
+    await runtime.tasks.setSpec("planning", { summary: "Implement duration", requirements: [{ statement: "Duration behavior is correct", kind: "behavior", priority: "must" }] });
+    const first = compactStep("backend", "src/PlanningService.ts", "npm test -- backend");
+    const second = compactStep("shared", "src/duration.ts", "npm test -- shared");
     await runtime.plan({ action: "create", steps: [first, second] });
     const guard = new PlanGuard(runtime.plans, runtime.registry);
     assert.equal((await guard.beforeMutation("planning", [fixture("backend/src/PlanningService.ts")])).allowed, true);
@@ -58,22 +64,19 @@ test("PlanGuard enforces current scope, generations, verification freshness, adv
     assert.equal(await guard.afterVerification("planning", "npm test -- backend", 0), true);
     await writeFile(editedFile, `${originalSource}\n// guarded mutation\n`);
     await guard.afterMutation("planning");
-    let completion = await runtime.plan({ action: "complete", evidence: "tests passed", verified_generation: 1 } as any) as any;
+    let completion = await runtime.plan({ action: "complete_current", evidence: "tests passed", verified_generation: 1 } as any) as any;
     assert.equal(completion.advanced, false); assert.match(completion.missing.join("\n"), /generation 1/);
     await guard.afterVerification("planning", "npm test -- backend", 1);
-    completion = await runtime.plan({ action: "complete" }) as any; assert.equal(completion.advanced, false);
+    completion = await runtime.plan({ action: "complete_current" }) as any; assert.equal(completion.advanced, false);
     await guard.afterVerification("planning", "npm test -- backend", 0);
-    completion = await runtime.plan({ action: "complete" }) as any;
+    completion = await runtime.plan({ action: "complete_current" }) as any;
     assert.deepEqual({ advanced: completion.advanced, completed: completion.completed_step, current: completion.current_step }, { advanced: true, completed: "S1", current: "S2" });
     assert.equal(((await runtime.plan({ action: "current" })) as any).step.id, "S2", "the model cannot select or skip the server-owned step");
 
-    await runtime.tasks.update("planning", undefined, { spec: "The confirmed specification changed." });
+    await runtime.tasks.setSpec("planning", { summary: "Changed duration behavior", requirements: [{ id: "R1", statement: "Duration behavior must change", kind: "behavior", priority: "must" }] });
     assert.equal((await guard.beforeMutation("planning", [fixture("shared/src/duration.ts")])).allowed, false);
-    completion = await runtime.plan({ action: "complete" }) as any; assert.equal(completion.advanced, false); assert.match(completion.missing.join("\n"), /stale/);
-    const { id: _serverId, ...replacement } = second;
-    const revised = await runtime.plan({ action: "revise", reason: "Spec changed and S2 remains the bounded implementation target",
-      operations: [{ op: "replace_current", step: replacement }] }) as any;
-    assert.equal(revised.revision, 2); assert.equal(revised.stale, false); assert.equal(revised.step.id, "S2");
+    completion = await runtime.plan({ action: "complete_current" }) as any; assert.equal(completion.advanced, false); assert.match(completion.missing.join("\n"), /stale/);
+    await assert.rejects(runtime.plan({ action: "revise_current", reason: "Attempted stale repair", step: second }), /PLAN_STALE/);
   } finally {
     await writeFile(editedFile, originalSource);
     if (original === undefined) delete process.env.CODE_INTELLIGENCE_WORKSPACE; else process.env.CODE_INTELLIGENCE_WORKSPACE = original;
@@ -87,8 +90,8 @@ test("installed OpenCode execute.before hook denies an actual out-of-step editor
   const editedFile = fixture("backend/src/PlanningService.ts"); const originalSource = await readFile(editedFile, "utf8");
   try {
     const runtime = new ToolRuntime(); await runtime.tasks.create("planning", "Hook guard");
-    await runtime.tasks.update("planning", undefined, { spec: "Only the current backend file may change." });
-    await runtime.plan({ action: "create", steps: [step("S1", "backend", "src/PlanningService.ts", "npm test -- backend")] });
+    await runtime.tasks.setSpec("planning", { summary: "Only backend changes", requirements: [{ statement: "Backend behavior remains correct", kind: "behavior", priority: "must" }] });
+    await runtime.plan({ action: "create", steps: [compactStep("backend", "src/PlanningService.ts", "npm test -- backend")] });
     const bin = path.join(env.root, "bin"); await mkdir(bin, { recursive: true });
     const executable = path.join(bin, "code-intelligence");
     const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
@@ -107,7 +110,7 @@ test("installed OpenCode execute.before hook denies an actual out-of-step editor
     await after[0]!({ tool: "edit", status: "completed", input: { filePath: editedFile }, result: {} });
     await before[0]!({ tool: "execute", input: { code: "npm test -- backend" } });
     await after[0]!({ tool: "execute", status: "completed", input: { code: "npm test -- backend" }, result: { output: { ok: true } } });
-    assert.equal(((await runtime.plan({ action: "complete" })) as any).advanced, true, "the after hook records fresh mechanical verification");
+    assert.equal(((await runtime.plan({ action: "complete_current" })) as any).advanced, true, "the after hook records fresh mechanical verification");
   } finally {
     await writeFile(editedFile, originalSource);
     process.env.PATH = originalPath;
@@ -125,7 +128,7 @@ test("plan paths reject unknown repositories, traversal, absolute and symlink es
     await writeFile(outside, "secret\n"); await symlink(outside, path.join(repo, "src", "escape.ts"));
     const registry = new WorkspaceRegistry(env.config, path.join(env.data, "workspaces")); await registry.add("planning", [repo]);
     const taskStorage = new TaskStorage(path.join(env.data, "workspaces")); const tasks = new TaskService(taskStorage);
-    await tasks.create("planning", "Path validation"); await tasks.update("planning", undefined, { spec: "Only bounded registered repository paths may be changed." });
+    await tasks.create("planning", "Path validation"); await tasks.setSpec("planning", { summary: "Bounded paths", requirements: [{ statement: "Only bounded registered paths are changed", kind: "constraint", priority: "must" }] });
     const plans = new PlanService(new PlanStorage(taskStorage), tasks, registry);
     const base = step("S1", "repo", "src/a.ts", "npm test");
     await assert.rejects(plans.create("planning", [{ ...base, writes: [{ repo: "missing", path: "src/a.ts" }] }]), /Unknown repository/);

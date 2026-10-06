@@ -18,7 +18,8 @@ export function formatToolResponse(value: unknown) {
   const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
   const alreadyEnvelope = candidate && ["ok", "error", "degraded"].includes(String(candidate.status))
     && ("data" in candidate || "message" in candidate);
-  const envelope: unknown = alreadyEnvelope ? value : { status: "ok", data: value, next_action: null, warnings: [], diagnostics: {} };
+  const guidance = candidate && typeof candidate.stage === "string" ? { stage: candidate.stage, required_skill: candidate.required_skill, next_action: candidate.next_action } : {};
+  const envelope: unknown = alreadyEnvelope ? value : { status: "ok", data: value, next_action: null, warnings: [], diagnostics: {}, ...guidance };
   let bounded: unknown = envelope; let serialized = JSON.stringify(bounded); let truncated = false;
   for (const [maxString, maxArray] of [[8_000, 50], [4_000, 20], [2_000, 10], [1_000, 5], [500, 3]] as const) {
     if (Buffer.byteLength(serialized) <= 24_000) break;
@@ -78,6 +79,7 @@ function failure(error: unknown, action?: string) {
         : /Verification|verification|writable path|cwd/i.test(message) ? "INVALID_VERIFICATION"
           : /No active|active memory|already has|suspended|not terminal|requires a reason|confirmed spec|Unknown memory|Completed tasks/i.test(message) ? "INVALID_STATE" : "REQUEST_FAILED";
   return { ...formatToolResponse({ status: "error", code, message: code === "REQUEST_FAILED" ? "Request failed; inspect current state and server diagnostics" : message,
+    ...(code === "NO_ACTIVE_MEMORY" ? { stage: "operator_action_required", required_skill: null } : {}),
     next_action: code === "NO_ACTIVE_MEMORY" ? "Ask the operator to select an active memory in the local control plane" : "Correct the reported condition and retry; use memory.current or plan.current for current state" }), isError: true };
 }
 

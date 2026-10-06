@@ -7,17 +7,19 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { instrumentQwenChunk, projectMemoryDeclaration } from "../scripts/qwen-memory-capture.mjs";
 
-test("projects only the complete memory declaration from the wire request", () => {
+test("projects only the complete memory and plan declarations from the wire request", () => {
   const schema = { type: "object", properties: { requirements: { items: { properties: { kind: { enum: ["constraint"] } } } } } };
   const request = {
     messages: [{ role: "user", content: "private prompt" }],
     tools: [
       { type: "function", function: { name: "other", description: "other", parameters: { secret: "omit" } } },
       { type: "function", function: { name: "mcp__code-intelligence__memory", description: "complete description", parameters: schema } },
+      { type: "function", function: { name: "mcp__code-intelligence__plan", description: "plan description", parameters: schema } },
     ],
   };
   assert.deepEqual(projectMemoryDeclaration(request), {
-    tools: [{ name: "mcp__code-intelligence__memory", description: "complete description", parametersJsonSchema: schema }],
+    tools: [{ name: "mcp__code-intelligence__memory", description: "complete description", parametersJsonSchema: schema },
+      { name: "mcp__code-intelligence__plan", description: "plan description", parametersJsonSchema: schema }],
   });
   assert.deepEqual(projectMemoryDeclaration({ tools: [{ type: "function", name: "mcp__code-intelligence__memory", description: "complete description", parameters: schema }] }), {
     tools: [{ name: "mcp__code-intelligence__memory", description: "complete description", parametersJsonSchema: schema }],

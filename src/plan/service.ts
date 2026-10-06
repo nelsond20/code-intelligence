@@ -10,8 +10,14 @@ import { appPaths } from "../workspace/paths.js";
 import { atomicWrite, readTextIfExists } from "../shared/fs.js";
 import { walkReadableFiles } from "../search/files.js";
 import { canonicalTarget } from "./target-path.js";
+import { planBindingStale, structuredSpecHash } from "./binding.js";
+import { cumulativeCodeHash, reviewReceiptCurrent } from "./review-state.js";
+import type { CompactPlanStep } from "../mcp/schemas.js";
 
-function hashSpec(spec: string): string { return crypto.createHash("sha256").update(spec.trim()).digest("hex"); }
+function expandCompactStep(step: CompactPlanStep): PlanStepInput {
+  return { ...step, writes: (step.writes || []).map((write) => ({ ...write, covers: step.covers })), context: step.context || [],
+    acceptance: step.acceptance.map((statement) => ({ statement, covers: step.covers })), verification: step.verification };
+}
 function hasConfirmedSpec(spec: string): boolean {
   return spec.split(/\r?\n/).some((line) => {
     const value = line.trim();
@@ -70,7 +76,7 @@ export class PlanService {
 
   private async active(workspaceId: string) {
     const memory = await this.tasks.current(workspaceId);
-    if (!memory) throw new Error("An active memory work item is required");
+    if (!memory) throw new Error("NO_ACTIVE_MEMORY: Select a memory in the local control plane before creating a plan");
     return memory;
   }
 
@@ -173,7 +179,9 @@ export class PlanService {
 
   async create(workspaceId: string, inputs: PlanStepInput[], exceptions: Array<{ requirement_id: string; reason: string }> = []): Promise<PlanState> {
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
-      const memory = await this.active(workspaceId); const spec = await this.spec(workspaceId, memory.id);
+      const memory = await this.active(workspaceId);
+      const spec = await this.storage.tasks.readStructuredSpec(workspaceId, memory.id);
+      if (!spec) throw new Error("SPEC_REQUIRED: Set a structured specification with memory.spec_set before creating a plan");
       if (!inputs.length || inputs.length > 50) throw new Error("A plan requires 1 to 50 steps");
       const previous = await this.storage.read(workspaceId, memory.id);
       if (previous && !["completed", "abandoned"].includes(previous.status)) throw new Error(`Memory already has a ${previous.status} plan; revise, complete, or abandon it`);
@@ -181,24 +189,75 @@ export class PlanService {
       const steps = await Promise.all(inputs.map((step, index) => this.normalizeStep(workspaceId, step, index === 0 ? "current" : "pending", `S${index + 1}`)));
       await this.assertCoverage(workspaceId, memory.id, steps, exceptions);
       const now = new Date().toISOString();
-      const plan: PlanState = { schema_version: 1, memory_id: memory.id, spec_hash: hashSpec(spec), revision: 1,
+      const plan: PlanState = { schema_version: 1, memory_id: memory.id, spec_hash: structuredSpecHash(spec), spec_revision: spec.revision, revision: 1,
         status: "active", current_step: 0, steps, revisions: [], lifecycle: [{ status: "active", at: now }], requirement_exceptions: exceptions, marker_exceptions: [], created_at: now, updated_at: now };
+      if (previous) await this.storage.archiveTerminal(workspaceId, previous);
       await this.storage.write(workspaceId, plan); return plan;
     });
   }
 
+  async createCompact(workspaceId: string, steps: CompactPlanStep[]): Promise<PlanState> {
+    return this.create(workspaceId, steps.map(expandCompactStep));
+  }
+
   async state(workspaceId: string): Promise<{ plan?: PlanState; stale: boolean }> {
     const memory = await this.tasks.current(workspaceId); if (!memory) return { stale: false };
-    const plan = await this.storage.read(workspaceId, memory.id); if (!plan) return { stale: false };
-    const spec = await this.storage.tasks.readSpec(workspaceId, memory.id);
-    return { plan, stale: hashSpec(spec) !== plan.spec_hash };
+    return this.stateForMemory(workspaceId, memory.id);
+  }
+
+  async stateForMemory(workspaceId: string, memoryId: string): Promise<{ plan?: PlanState; stale: boolean }> {
+    const plan = await this.storage.read(workspaceId, memoryId); if (!plan) return { stale: false };
+    return { plan, stale: await planBindingStale(this.storage.tasks, workspaceId, plan) };
+  }
+
+  async inspect(workspaceId: string, memoryId: string) {
+    const { plan, stale } = await this.stateForMemory(workspaceId, memoryId);
+    if (!plan) return { plan: null, stale: false, review_gate: "no_plan" };
+    const receiptCurrent = await this.reviewCurrent(workspaceId, plan);
+    return { plan, stale, review_gate: stale ? "plan_stale" : plan.status === "completed" ? receiptCurrent ? "satisfied" : "legacy_unverified" : plan.status === "final_review"
+      ? receiptCurrent ? "ready" : "code_review_required" : "not_ready", receipt_current: receiptCurrent,
+      unresolved_markers: plan.status === "final_review" ? await this.unresolvedMarkers(workspaceId, plan) : [] };
+  }
+
+  async markWriteNotNeeded(workspaceId: string, memoryId: string, repo: string, file: string, reason: string): Promise<PlanState> {
+    const selected = await this.active(workspaceId);
+    if (selected.id !== memoryId) throw new Error("Select this memory before resolving its current write");
+    return this.reviseOperations(workspaceId, reason, [{ op: "mark_write_not_needed", repo, path: file, reason }], memoryId);
+  }
+
+  async allowFinalMarker(workspaceId: string, memoryId: string, repo: string, file: string, reason: string): Promise<PlanState> {
+    if (!reason.trim()) throw new Error("An administrative marker exception requires a reason");
+    return this.storage.tasks.workspaceLock(workspaceId, async () => {
+      const plan = await this.storage.read(workspaceId, memoryId);
+      if (!plan || plan.status !== "final_review") throw new Error("Marker exceptions require final_review");
+      if ((await this.stateForMemory(workspaceId, memoryId)).stale) throw new Error("PLAN_STALE: Cannot resolve markers against an older spec");
+      const canonical = await this.canonicalPath(workspaceId, repo, file, false);
+      if (!plan.steps.some((step) => step.modified_paths.some((item) => item.repo === repo && item.path === canonical))) throw new Error("Marker exception path is outside the cumulative plan delta");
+      const repository = await this.registry.resolveRepository(workspaceId, repo);
+      const source = await readFile(path.join(repository.path, canonical), "utf8");
+      const marker = /\bTODO\b|not implemented|throw new Error\(["']not implemented/i.exec(source)?.[0];
+      if (!marker) throw new Error("No unresolved implementation marker exists at this path");
+      plan.marker_exceptions = [...plan.marker_exceptions.filter((item) => item.repo !== repo || item.path !== canonical),
+        { repo, path: canonical, marker, reason: reason.trim() }];
+      plan.revision += 1; plan.updated_at = new Date().toISOString();
+      plan.revisions = [...plan.revisions, { revision: plan.revision, reason: `Administrative marker exception: ${reason.trim()}`, at: plan.updated_at }].slice(-20);
+      delete plan.review_receipt;
+      await this.storage.write(workspaceId, plan); return plan;
+    });
   }
 
   async current(workspaceId: string, integration: "opencode" | "unknown" = "opencode") {
     const { plan, stale } = await this.state(workspaceId); if (!plan) return { active: false as const };
     if (plan.status === "completed" || plan.status === "abandoned") return { active: false as const, completed: plan.status === "completed", abandoned: plan.status === "abandoned", revision: plan.revision };
+    if (plan.status === "final_review") return { active: false as const, status: "final_review" as const, stale, spec_revision: plan.spec_revision,
+      review_gate: stale ? "PLAN_STALE" : await this.reviewCurrent(workspaceId, plan) ? "ready" : "CODE_REVIEW_REQUIRED",
+      completed_steps: plan.steps.length, total: plan.steps.length,
+      next_action: stale ? "Ask the operator to resolve the stale plan" : "Invoke code-review-and-quality on the cumulative plan delta; the operator finishes the plan after a clean review" };
     const step = plan.steps[plan.current_step]!;
-    return { active: (plan.status === "active") as boolean, status: plan.status, guard_status: plan.status === "active" ? await this.guardStatus(workspaceId, integration) : "unavailable", stale, revision: plan.revision, position: plan.current_step + 1, total: plan.steps.length,
+    return { active: (plan.status === "active") as boolean, status: plan.status, guard_status: plan.status === "active" ? await this.guardStatus(workspaceId, integration) : "unavailable", stale,
+      stale_reason: stale ? "The memory specification changed after this plan was created; ask the operator to abandon and recreate the plan" : undefined,
+      spec_revision: plan.spec_revision, revision: plan.revision, position: plan.current_step + 1, total: plan.steps.length,
+      next_action: stale ? "Ask the operator to resolve the stale plan" : plan.status === "active" ? "Work only the current step, then call complete_current" : "Ask the operator to reactivate or abandon the plan",
       step: { id: step.id, kind: step.kind, title: step.title, objective: step.objective, covers: step.covers, writes: step.writes, context: step.context,
         acceptance: step.acceptance, verification: step.verification.map((verification) => ({ id: verification.id, command: verificationCommand(verification), expect_exit: verification.expect_exit, current: verification.verified_generation === step.mutation_generation })),
         mutation_generation: step.mutation_generation, modified_paths: step.modified_paths } };
@@ -212,21 +271,19 @@ export class PlanService {
       `Goal: ${current.step.objective}`, `Write: ${current.step.writes.map((item) => `${item.repo}:${item.path}`).join(", ")}`].join("\n\n");
   }
 
-  async complete(workspaceId: string) {
+  async complete(workspaceId: string, allowFinalReview = true) {
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
       const { plan, stale } = await this.state(workspaceId); if (!plan || !["active", "final_review"].includes(plan.status)) throw new Error("No active plan");
       if (stale) return { advanced: false, message: "STEP NOT COMPLETE", missing: ["plan is stale because the confirmed spec changed"] };
       if (plan.status === "final_review") {
+        if (!allowFinalReview) throw new Error("CODE_REVIEW_REQUIRED: Final plan completion belongs to the operator after the cumulative review gate");
         const gaps: string[] = []; const covered = new Set(plan.steps.flatMap((item) => item.covers));
         const spec = await this.storage.tasks.readStructuredSpec(workspaceId, plan.memory_id);
         for (const requirement of spec?.requirements || []) if (requirement.priority === "must" && !covered.has(requirement.id)
           && !plan.requirement_exceptions.some((item) => item.requirement_id === requirement.id)) gaps.push(`${requirement.id} has no final evidence`);
-        const markers = /\bTODO\b|not implemented|throw new Error\(["']not implemented/i;
-        for (const item of plan.steps.flatMap((step) => step.modified_paths)) {
-          const repository = await this.registry.resolveRepository(workspaceId, item.repo);
-          try { if (markers.test(await readFile(path.join(repository.path, item.path), "utf8"))
-            && !plan.marker_exceptions.some((exception) => exception.repo === item.repo && exception.path === item.path)) gaps.push(`${item.repo}:${item.path} contains an unresolved implementation marker`); }
-          catch { gaps.push(`${item.repo}:${item.path} is no longer readable`); }
+        gaps.push(...(await this.unresolvedMarkers(workspaceId, plan)).map((item) => `${item} contains an unresolved implementation marker`));
+        if (!(await this.reviewCurrent(workspaceId, plan))) {
+          gaps.push("CODE_REVIEW_REQUIRED: a fresh, clean code-review-and-quality receipt is required for the cumulative plan code state");
         }
         if (gaps.length) return { advanced: false, message: "FINAL REVIEW NOT COMPLETE", missing: gaps };
         plan.status = "completed"; plan.updated_at = new Date().toISOString();
@@ -250,18 +307,64 @@ export class PlanService {
       if (missing.length) return { advanced: false, message: "STEP NOT COMPLETE", missing };
       step.status = "completed"; const completed = plan.current_step;
       if (completed + 1 < plan.steps.length) { plan.current_step += 1; plan.steps[plan.current_step]!.status = "current"; }
-      else plan.status = "final_review";
+      else { plan.status = "final_review"; plan.lifecycle.push({ status: "final_review", at: new Date().toISOString() }); }
       plan.updated_at = new Date().toISOString(); await this.storage.write(workspaceId, plan);
       return { advanced: true, completed_step: step.id, plan_completed: false, final_review: plan.status === "final_review",
         current_step: plan.status === "active" ? plan.steps[plan.current_step]!.id : undefined };
     });
   }
 
+  async completeCurrent(workspaceId: string) {
+    return this.complete(workspaceId, false);
+  }
+
+  async reviseCurrentCompact(workspaceId: string, reason: string, input: CompactPlanStep): Promise<PlanState> {
+    if (!reason.trim() || reason.trim().length > 2_000) throw new Error("Plan revision requires a bounded reason");
+    return this.storage.tasks.workspaceLock(workspaceId, async () => {
+      const memory = await this.active(workspaceId);
+      const { plan, stale } = await this.state(workspaceId);
+      if (!plan || plan.status !== "active") throw new Error("No active plan");
+      if (stale) throw new Error("PLAN_STALE: The memory specification changed; ask the operator to resolve the plan");
+      const old = plan.steps[plan.current_step]!;
+      const revised = await this.normalizeStep(workspaceId, expandCompactStep(input), "current", old.id);
+      const allowed = new Set(revised.writes.map((write) => `${write.repo}:${write.path}`));
+      if (old.modified_paths.some((item) => !allowed.has(`${item.repo}:${item.path}`))) throw new Error("Revised current step cannot discard paths already modified");
+      revised.modified_paths = old.modified_paths; revised.mutation_generation = old.mutation_generation; revised.violations = old.violations;
+      const steps = [...plan.steps]; steps[plan.current_step] = revised;
+      await this.assertCoverage(workspaceId, memory.id, steps, plan.requirement_exceptions);
+      plan.steps = steps; plan.revision += 1; plan.updated_at = new Date().toISOString();
+      plan.revisions.push({ revision: plan.revision, reason: reason.trim(), at: plan.updated_at, previous_step: old });
+      plan.revisions = plan.revisions.slice(-20);
+      await this.storage.write(workspaceId, plan); return plan;
+    });
+  }
+
+  async codeStateHash(workspaceId: string, plan: PlanState): Promise<string> {
+    return cumulativeCodeHash(workspaceId, plan, this.registry);
+  }
+
+  private async reviewCurrent(workspaceId: string, plan: PlanState): Promise<boolean> {
+    return reviewReceiptCurrent(workspaceId, plan, this.registry);
+  }
+
+  private async unresolvedMarkers(workspaceId: string, plan: PlanState): Promise<string[]> {
+    const markers = /\bTODO\b|not implemented|throw new Error\(["']not implemented/i;
+    const unresolved: string[] = [];
+    for (const item of plan.steps.flatMap((step) => step.modified_paths)) {
+      if (plan.marker_exceptions.some((exception) => exception.repo === item.repo && exception.path === item.path)) continue;
+      try { const repository = await this.registry.resolveRepository(workspaceId, item.repo);
+        if (markers.test(await readFile(path.join(repository.path, item.path), "utf8"))) unresolved.push(`${item.repo}:${item.path}`); }
+      catch { unresolved.push(`${item.repo}:${item.path}`); }
+    }
+    return [...new Set(unresolved)];
+  }
+
   async revise(workspaceId: string, reason: string, currentInput: PlanStepInput, futureInputs: PlanStepInput[] = []): Promise<PlanState> {
     if (!reason.trim() || reason.trim().length > 2_000) throw new Error("Plan revision requires a bounded reason");
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
-      const memory = await this.active(workspaceId); const spec = await this.spec(workspaceId, memory.id);
+      const memory = await this.active(workspaceId); await this.spec(workspaceId, memory.id);
       const existing = await this.storage.read(workspaceId, memory.id); if (!existing || existing.status !== "active") throw new Error("No active plan");
+      if ((await this.stateForMemory(workspaceId, memory.id)).stale) throw new Error("PLAN_STALE: The memory specification changed; abandon and recreate this plan");
       const current = existing.steps[existing.current_step]!;
       if (currentInput.id !== current.id) throw new Error(`Revision cannot skip the server-owned current step ${current.id}`);
       this.assertUniqueSteps([currentInput, ...futureInputs]);
@@ -269,7 +372,7 @@ export class PlanService {
       const future = await Promise.all(futureInputs.map((step, index) => this.normalizeStep(workspaceId, step, "pending", `S${existing.current_step + index + 2}`)));
       existing.steps = [...existing.steps.slice(0, existing.current_step), revisedCurrent, ...future];
       await this.assertCoverage(workspaceId, memory.id, existing.steps, existing.requirement_exceptions);
-      existing.spec_hash = hashSpec(spec); existing.revision += 1; existing.updated_at = new Date().toISOString();
+      existing.revision += 1; existing.updated_at = new Date().toISOString();
       existing.revisions = [...existing.revisions, { revision: existing.revision, reason: reason.trim(), at: existing.updated_at }].slice(-20);
       await this.storage.write(workspaceId, existing); return existing;
     });
@@ -279,11 +382,13 @@ export class PlanService {
     { op: "replace_current"; step: PlanStepInput } | { op: "append_steps"; steps: PlanStepInput[] } | { op: "drop_future" }
     | { op: "mark_write_not_needed"; repo: string; path: string; reason: string }
     | { op: "set_requirement_exception"; requirement_id: string; reason: string }
-    | { op: "allow_marker"; repo: string; path: string; marker: string; reason: string }>): Promise<PlanState> {
+    | { op: "allow_marker"; repo: string; path: string; marker: string; reason: string }>, expectedMemoryId?: string): Promise<PlanState> {
     if (!reason.trim() || reason.trim().length > 2_000) throw new Error("Plan revision requires a bounded reason");
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
-      const memory = await this.active(workspaceId); const spec = await this.spec(workspaceId, memory.id);
+      const memory = await this.active(workspaceId); await this.spec(workspaceId, memory.id);
+      if (expectedMemoryId && memory.id !== expectedMemoryId) throw new Error("Selected memory changed before plan resolution");
       const plan = await this.storage.read(workspaceId, memory.id); if (!plan || plan.status !== "active") throw new Error("No active plan");
+      if ((await this.stateForMemory(workspaceId, memory.id)).stale) throw new Error("PLAN_STALE: The memory specification changed; abandon and recreate this plan");
       for (const operation of operations) {
         if (operation.op === "replace_current") plan.steps[plan.current_step] = await this.normalizeStep(workspaceId,
           { ...operation.step, id: plan.steps[plan.current_step]!.id }, "current", plan.steps[plan.current_step]!.id);
@@ -304,7 +409,7 @@ export class PlanService {
         }
       }
       await this.assertCoverage(workspaceId, memory.id, plan.steps, plan.requirement_exceptions);
-      plan.spec_hash = hashSpec(spec); plan.revision += 1; plan.updated_at = new Date().toISOString();
+      plan.revision += 1; plan.updated_at = new Date().toISOString();
       plan.revisions = [...plan.revisions, { revision: plan.revision, reason: reason.trim(), at: plan.updated_at }].slice(-20);
       await this.storage.write(workspaceId, plan); return plan;
     });
@@ -339,7 +444,7 @@ export class PlanService {
       for (const target of changed) if (!step.modified_paths.some((item) => item.repo === target.repo && item.path === target.path)) step.modified_paths.push(target);
       step.verification = step.verification.map(({ verified_generation: _generation, last_exit: _exit, ...verification }) => verification);
       await this.markIndexDirty(workspaceId, changed);
-      plan.updated_at = new Date().toISOString(); await this.storage.write(workspaceId, plan);
+      plan.updated_at = new Date().toISOString(); plan.last_mutation_at = plan.updated_at; delete plan.review_receipt; await this.storage.write(workspaceId, plan);
       return true;
     });
   }
@@ -388,6 +493,7 @@ export class PlanService {
           if (!step.modified_paths.some((entry) => entry.repo === target.repo && entry.path === target.path)) step.modified_paths.push(target); }
         step.verification = step.verification.map(({ verified_generation: _generation, last_exit: _exit, ...verification }) => verification);
         await this.markIndexDirty(workspaceId, authorized.map((item) => { const [repo, ...parts] = item.split(":"); return { repo: repo!, path: parts.join(":") }; }));
+        plan.last_mutation_at = now; delete plan.review_receipt;
       }
       let verified = false;
       if (changed.length === 0) {
@@ -399,15 +505,44 @@ export class PlanService {
   }
 
   async transition(workspaceId: string, status: "suspended" | "active" | "abandoned", reason?: string): Promise<PlanState> {
+    const memory = await this.active(workspaceId);
+    return this.transitionForMemory(workspaceId, memory.id, status, reason);
+  }
+
+  async transitionForMemory(workspaceId: string, memoryId: string, status: "suspended" | "active" | "abandoned", reason?: string): Promise<PlanState> {
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
-      const memory = await this.active(workspaceId); const plan = await this.storage.read(workspaceId, memory.id);
+      const plan = await this.storage.read(workspaceId, memoryId);
       if (!plan || ["completed", "abandoned"].includes(plan.status)) throw new Error("No non-terminal plan");
       if (status === "active" && plan.status !== "suspended") throw new Error("Only a suspended plan can be reactivated");
       if (status === "suspended" && plan.status !== "active") throw new Error("Only an active plan can be suspended");
       if (status === "abandoned" && !reason?.trim()) throw new Error("Abandoning a plan requires a reason");
+      if (status === "active") {
+        if (plan.archived_at) throw new Error("Restore this archived plan before reactivating it");
+        const selected = await this.tasks.current(workspaceId);
+        if (selected?.id !== memoryId) throw new Error("Select this memory as active before reactivating its plan");
+        if ((await this.stateForMemory(workspaceId, memoryId)).stale) throw new Error("PLAN_STALE: Abandon and recreate this plan against the current spec");
+      }
       plan.status = status; plan.updated_at = new Date().toISOString();
       plan.lifecycle = [...plan.lifecycle, { status, reason: reason?.trim(), at: plan.updated_at }].slice(-50);
       await this.storage.write(workspaceId, plan); return plan;
+    });
+  }
+
+  async setArchived(workspaceId: string, memoryId: string, archived: boolean): Promise<PlanState> {
+    return this.storage.tasks.workspaceLock(workspaceId, async () => {
+      const plan = await this.storage.read(workspaceId, memoryId);
+      if (!plan) throw new Error("No plan for this memory");
+      if (archived && ["active", "final_review"].includes(plan.status)) throw new Error("Suspend or abandon the active plan before archiving it");
+      if (archived) plan.archived_at = new Date().toISOString(); else delete plan.archived_at;
+      await this.storage.write(workspaceId, plan);
+      return plan;
+    });
+  }
+
+  async deleteForMemory(workspaceId: string, memoryId: string): Promise<void> {
+    await this.storage.tasks.workspaceLock(workspaceId, async () => {
+      if (!(await this.storage.read(workspaceId, memoryId))) throw new Error("No plan for this memory");
+      await this.storage.delete(workspaceId, memoryId);
     });
   }
 }

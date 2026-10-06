@@ -30,7 +30,7 @@ export function renderTaskContext(state: TaskState, findingsPath: string, specPa
     `Work: ${bootstrap.title} (${bootstrap.id}, ${bootstrap.status})`,
     `Objective: ${bootstrap.objective || "Not set"}`,
     `Phase: ${bootstrap.phase}`,
-    `For full records and the structured spec, call memory.read with id ${bootstrap.id}.`,
+    "For full records and the structured spec, call memory.current on the operator-selected active memory.",
   ];
   const optional = [
     ...bootstrap.blockers.map((v) => `Blocker: ${v}`),

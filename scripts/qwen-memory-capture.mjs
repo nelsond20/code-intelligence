@@ -19,6 +19,7 @@ const headlessMarker = "const responseStream=llmClient.sendMessageStream(current
 const remindersMarker = "const reminderParts=[buildMcpServerInstructionsReminder(toolRegistry),skillsResult?.reminder??null,startupReminder,includeDeferredToolsReminder?buildDeferredToolsReminder(toolRegistry):null].filter(text=>text!==null).map(text=>({text}));const prelude=reminderParts.length===0?[]:[{role:\"user\",parts:reminderParts}];";
 const coreMarker = "return generator.generateContentStream(request,prompt_id)";
 const memoryName = "mcp__code-intelligence__memory";
+const planName = "mcp__code-intelligence__plan";
 
 let firstUserTurn;
 const initialDeferredReminders = new WeakMap();
@@ -75,7 +76,7 @@ export function runUserTurnModelRequest(promptId, chat, send) {
 
 export function projectMemoryDeclaration(request) {
   const matches = (Array.isArray(request?.tools) ? request.tools : [])
-    .filter((tool) => tool?.type === "function" && (tool.function?.name ?? tool.name) === "mcp__code-intelligence__memory")
+    .filter((tool) => tool?.type === "function" && [memoryName, planName].includes(tool.function?.name ?? tool.name))
     .map((tool) => {
       const { name, description, parameters } = tool.function ?? tool;
       if (typeof description !== "string" || !parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
@@ -83,7 +84,7 @@ export function projectMemoryDeclaration(request) {
       }
       return { name, description, parametersJsonSchema: parameters };
     });
-  if (matches.length > 1) throw new Error("Duplicate memory declarations in model request");
+  if (new Set(matches.map((tool) => tool.name)).size !== matches.length) throw new Error("Duplicate Code Intelligence declarations in model request");
   return { tools: matches };
 }
 
@@ -101,7 +102,8 @@ export function captureQwenOpenAIRequest(request, userPromptId, protocol) {
     const registryState = deferredState(registry);
     const announced = firstUserTurn.client?.announcedDeferredToolNames?.has(memoryName) === true;
     const reminder = registry ? initialDeferredReminders.get(registry) : undefined;
-    const memoryInNormalTools = declaration.tools.length === 1;
+    const memoryInNormalTools = declaration.tools.some((tool) => tool.name === memoryName);
+    const planInNormalTools = declaration.tools.some((tool) => tool.name === planName);
     const result = {
       ...declaration,
       capture: {
@@ -122,6 +124,7 @@ export function captureQwenOpenAIRequest(request, userPromptId, protocol) {
           ? reminder.summary_description_equals_full_description : null,
         schema_in_initial_reminder: reminder?.memory_name_in_constructed_reminder ? false : null,
         memory_in_normal_tools_array: memoryInNormalTools,
+        plan_in_normal_tools_array: planInNormalTools,
         full_description_and_schema_in_normal_tools_array: memoryInNormalTools,
       },
     };

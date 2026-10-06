@@ -21,10 +21,9 @@ test("public MCP schemas never expose workspace selection", () => {
   for (const field of ["workspace", "current_focus", "next_actions", "id", "title", "operations", "revision"]) assert.equal(Object.hasOwn(memoryInput.shape, field), false);
   assert.deepEqual(memoryInput.shape.action.options, ["current", "note", "resolve", "spec_set"]);
   for (const option of planInput.options) assert.equal(Object.hasOwn(option.shape, "workspace"), false);
-  assert.deepEqual(planInput.options.map((option) => option.shape.action.value), ["create", "current", "complete", "revise", "suspend", "reactivate", "abandon"]);
+  assert.deepEqual(planInput.options.map((option) => option.shape.action.value), ["current", "create", "complete_current", "revise_current"]);
   assert.deepEqual(planInput.options.map((option) => Object.keys(option.shape).sort()), [
-    ["action", "exceptions", "steps"], ["action"], ["action"], ["action", "operations", "reason"],
-    ["action", "reason"], ["action"], ["action", "reason"],
+    ["action"], ["action", "steps"], ["action"], ["action", "reason", "step"],
   ]);
 });
 

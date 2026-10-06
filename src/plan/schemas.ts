@@ -77,13 +77,18 @@ export const planStepSchema = z.object({
 
 export const planStateSchema = z.object({
   schema_version: z.literal(1), memory_id: z.string(), spec_hash: z.string().length(64),
+  spec_revision: z.number().int().min(1).optional(),
   revision: z.number().int().min(1), status: z.enum(["active", "suspended", "final_review", "completed", "abandoned"]), current_step: z.number().int().min(0),
   steps: z.array(planStepSchema).min(1),
-  revisions: z.array(z.object({ revision: z.number().int(), reason: z.string(), at: z.string() })).max(20).default([]),
+  revisions: z.array(z.object({ revision: z.number().int(), reason: z.string(), at: z.string(), previous_step: planStepSchema.optional() })).max(20).default([]),
   lifecycle: z.array(z.object({ status: z.string(), reason: z.string().optional(), at: z.string() })).max(50).default([]),
   requirement_exceptions: z.array(z.object({ requirement_id: z.string(), reason: z.string() })).max(100).default([]),
   marker_exceptions: z.array(z.object({ repo: z.string(), path: z.string(), marker: z.string(), reason: z.string() })).max(100).default([]),
   final_evidence: z.object({ covered_requirements: z.array(z.string()), modified_paths: z.array(z.string()), verifications: z.array(z.string()), completed_at: z.string() }).optional(),
+  review_receipt: z.object({ skill: z.literal("code-review-and-quality"), code_hash: z.string().length(64), reviewed_at: z.string(),
+    status: z.literal("completed"), blocking_findings: z.literal(false), artifact: z.string().optional() }).optional(),
+  last_mutation_at: z.string().optional(),
+  archived_at: z.string().optional(),
   created_at: z.string(), updated_at: z.string(),
 });
 

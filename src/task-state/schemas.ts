@@ -20,6 +20,7 @@ const memoryRecordSchema = z.object({
   text: z.string(), status: memoryRecordStatusSchema, confidence: confidenceSchema,
   evidence_refs: z.array(z.string()).default([]), repo: z.string().optional(), file: z.string().optional(), symbol: z.string().optional(),
   reason: z.string().optional(), created_at: z.string(), updated_at: z.string(),
+  archived_at: z.string().optional(),
 });
 
 const hypothesisSchema = z.object({
@@ -47,6 +48,9 @@ export const taskStateSchema = z.object({
   inspected_symbols: z.array(z.string()).default([]),
   inspected_commits: z.array(z.object({ repo: z.string(), commit: z.string() })).default([]),
   records: z.array(memoryRecordSchema).max(500).default([]),
+  next_record_id: z.number().int().min(1).optional(),
+  archived_at: z.string().optional(),
+  spec_archived_at: z.string().optional(),
   outcome: z.object({ summary: z.string(), limitations: z.array(z.string()), evidence_refs: z.array(z.string()), completed_at: z.string() }).optional(),
   created_at: z.string(),
   updated_at: z.string(),

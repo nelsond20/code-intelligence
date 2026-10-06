@@ -1,13 +1,23 @@
 import { TaskService } from "../task-state/service.js";
 import { PlanStorage } from "../plan/storage.js";
+import { PlanService } from "../plan/service.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import type { TaskState } from "../task-state/schemas.js";
 
-export type MemoryFilters = { query?: string; status?: string; phase?: string; has_spec?: string; unresolved?: string; modified?: string; sort?: string };
+export type MemoryFilters = { query?: string; status?: string; phase?: string; has_spec?: string; spec_archived?: string; unresolved?: string; modified?: string; sort?: string; archived?: string };
 export type PlanDecision = "suspend" | "abandon";
+function hasLegacySpec(markdown: string): boolean {
+  return markdown.split(/\r?\n/).some((line) => {
+    const value = line.trim();
+    return !!value && !value.startsWith("#") && value !== "Confirmed design and implementation conclusions are recorded here.";
+  });
+}
 
 export class MemoryControlService {
-  constructor(readonly tasks = new TaskService(), readonly registry = new WorkspaceRegistry(), readonly planStorage = new PlanStorage(tasks.storage)) {}
+  readonly plans: PlanService;
+  constructor(readonly tasks = new TaskService(), readonly registry = new WorkspaceRegistry(), readonly planStorage = new PlanStorage(tasks.storage)) {
+    this.plans = new PlanService(planStorage, tasks, registry);
+  }
 
   async workspaces() { return this.registry.list(); }
 
@@ -16,20 +26,24 @@ export class MemoryControlService {
     const query = (filters.query || "").trim().toLocaleLowerCase();
     const rows = [];
     for (const state of await this.tasks.list(workspace)) {
+      if (filters.archived === "yes" ? !state.archived_at : filters.archived !== "all" && !!state.archived_at) continue;
       const spec = await this.tasks.storage.readStructuredSpec(workspace, state.id);
+      const hasSpec = !!spec || hasLegacySpec(await this.tasks.storage.readSpec(workspace, state.id));
       const plan = await this.planStorage.read(workspace, state.id);
       const unresolved = state.records.some((item) => ["observed", "supported"].includes(item.status));
       const haystack = [state.title, state.objective, spec?.summary, ...(spec?.requirements.map((item) => item.statement) || []), ...state.records.map((item) => item.text)].join("\n").toLocaleLowerCase();
       if (query && !haystack.includes(query)) continue;
       if (filters.status && filters.status !== "all" && state.status !== filters.status) continue;
       if (filters.phase && filters.phase !== "all" && state.phase !== filters.phase) continue;
-      if (filters.has_spec === "yes" && !spec || filters.has_spec === "no" && !!spec) continue;
+      if (filters.has_spec === "yes" && !hasSpec || filters.has_spec === "no" && hasSpec) continue;
+      if (filters.spec_archived === "yes" && !state.spec_archived_at || filters.spec_archived === "no" && !!state.spec_archived_at) continue;
       if (filters.unresolved === "yes" && !unresolved || filters.unresolved === "no" && unresolved) continue;
       if (filters.modified === "day" && Date.now() - Date.parse(state.updated_at) > 86_400_000) continue;
       if (filters.modified === "week" && Date.now() - Date.parse(state.updated_at) > 7 * 86_400_000) continue;
       if (filters.modified === "month" && Date.now() - Date.parse(state.updated_at) > 30 * 86_400_000) continue;
-      rows.push({ id: state.id, title: state.title, status: state.status, phase: state.phase, updated_at: state.updated_at,
-        has_spec: !!spec, unresolved, record_count: state.records.length, plan_status: plan?.status });
+      rows.push({ id: state.id, title: state.title, status: state.status, phase: state.phase, archived_at: state.archived_at,
+        spec_archived_at: state.spec_archived_at, updated_at: state.updated_at,
+        has_spec: hasSpec, unresolved, record_count: state.records.length, plan_status: plan?.status });
     }
     if (filters.sort === "oldest") rows.sort((a, b) => a.updated_at.localeCompare(b.updated_at));
     else if (filters.sort === "title") rows.sort((a, b) => a.title.localeCompare(b.title));
@@ -40,17 +54,127 @@ export class MemoryControlService {
   async detail(workspace: string, id: string) {
     await this.registry.get(workspace);
     const memory = await this.tasks.read(workspace, id);
+    const legacyMarkdown = memory.spec ? undefined : await this.tasks.storage.readSpec(workspace, id);
     const plan = await this.planStorage.read(workspace, id);
     const revisions = [];
     for (let revision = 1; revision <= (memory.spec?.revision || 0); revision++) revisions.push(await this.tasks.storage.readSpecRevision(workspace, id, revision));
-    return { memory, plan_status: plan?.status, revisions };
+    return { memory, legacy_spec: legacyMarkdown && hasLegacySpec(legacyMarkdown) ? legacyMarkdown : undefined,
+      plan_status: plan?.status, plan: await this.plans.inspect(workspace, id), revisions };
   }
 
-  async create(workspace: string, phase = "investigation") {
+  async create(workspace: string, phase = "investigation", requestedTitle?: string) {
     await this.registry.get(workspace);
     if (!["investigation", "implementation", "verification", "review"].includes(phase)) throw new Error("Invalid phase");
-    const title = `${workspace} - ${new Date().toISOString().replace("T", " ").slice(0, 16)} UTC`;
+    const title = requestedTitle?.trim() || `${workspace} - ${new Date().toISOString().replace("T", " ").slice(0, 16)} UTC`;
     return this.tasks.create(workspace, title, { phase, activate: false });
+  }
+
+  async rename(workspace: string, id: string, title: string) {
+    await this.registry.get(workspace);
+    return this.tasks.update(workspace, id, { title: title.trim() });
+  }
+
+  async archiveMemory(workspace: string, id: string, archived: boolean) {
+    await this.registry.get(workspace);
+    return this.tasks.storage.workspaceLock(workspace, async () => {
+      const memory = await this.tasks.storage.read(workspace, id);
+      const plan = await this.planStorage.read(workspace, id);
+      if (archived && plan && ["active", "final_review"].includes(plan.status)) throw new Error("Suspend or abandon the plan before archiving this memory");
+      if (archived) memory.archived_at = new Date().toISOString(); else delete memory.archived_at;
+      if (archived && memory.status === "active") memory.status = "paused";
+      memory.updated_at = new Date().toISOString();
+      await this.tasks.storage.write(workspace, memory);
+      return memory;
+    });
+  }
+
+  async deleteMemory(workspace: string, id: string) {
+    await this.registry.get(workspace);
+    return this.tasks.storage.workspaceLock(workspace, async () => {
+      await this.tasks.storage.read(workspace, id);
+      await this.tasks.storage.deleteTask(workspace, id);
+      return { deleted: true, id };
+    });
+  }
+
+  async archiveNote(workspace: string, id: string, recordId: string, archived: boolean) {
+    await this.registry.get(workspace);
+    return this.tasks.storage.workspaceLock(workspace, async () => {
+      const memory = await this.tasks.storage.read(workspace, id);
+      const record = memory.records.find((item) => item.id === recordId);
+      if (!record) throw new Error(`Unknown note: ${recordId}`);
+      if (archived) record.archived_at = new Date().toISOString(); else delete record.archived_at;
+      memory.updated_at = new Date().toISOString();
+      await this.tasks.storage.write(workspace, memory);
+      return record;
+    });
+  }
+
+  async deleteNote(workspace: string, id: string, recordId: string) {
+    await this.registry.get(workspace);
+    return this.tasks.storage.workspaceLock(workspace, async () => {
+      const memory = await this.tasks.storage.read(workspace, id);
+      const record = memory.records.find((item) => item.id === recordId);
+      if (!record) throw new Error(`Unknown note: ${recordId}`);
+      memory.next_record_id ||= Math.max(0, ...memory.records.map((item) => Number(item.id.slice(1)) || 0)) + 1;
+      memory.records = memory.records.filter((item) => item.id !== recordId);
+      if (!memory.records.some((item) => item.text === record.text)) {
+        memory.confirmed_findings = memory.confirmed_findings.filter((item) => item !== record.text);
+        memory.open_questions = memory.open_questions.filter((item) => item !== record.text);
+        memory.blockers = memory.blockers.filter((item) => item !== record.text);
+        memory.active_hypotheses = memory.active_hypotheses.filter((item) => item.text !== record.text);
+        memory.rejected_hypotheses = memory.rejected_hypotheses.filter((item) => item.text !== record.text);
+      }
+      memory.updated_at = new Date().toISOString();
+      await this.tasks.storage.transaction(workspace, id, "delete-memory-note", async () => {
+        await this.tasks.storage.removeFinding(workspace, id, record);
+        await this.tasks.storage.write(workspace, memory);
+      });
+      return { deleted: true, record_id: recordId };
+    });
+  }
+
+  async archiveSpec(workspace: string, id: string, archived: boolean) {
+    await this.registry.get(workspace);
+    return this.tasks.storage.workspaceLock(workspace, async () => {
+      const memory = await this.tasks.storage.read(workspace, id);
+      if (!(await this.tasks.storage.readStructuredSpec(workspace, id)) && !hasLegacySpec(await this.tasks.storage.readSpec(workspace, id))) {
+        throw new Error("No specification for this memory");
+      }
+      if (archived) memory.spec_archived_at = new Date().toISOString(); else delete memory.spec_archived_at;
+      memory.updated_at = new Date().toISOString();
+      await this.tasks.storage.write(workspace, memory);
+      return memory;
+    });
+  }
+
+  async deleteSpec(workspace: string, id: string) {
+    await this.registry.get(workspace);
+    return this.tasks.storage.workspaceLock(workspace, async () => {
+      const memory = await this.tasks.storage.read(workspace, id);
+      if (!(await this.tasks.storage.readStructuredSpec(workspace, id)) && !hasLegacySpec(await this.tasks.storage.readSpec(workspace, id))) {
+        throw new Error("No specification for this memory");
+      }
+      if (await this.planStorage.read(workspace, id)) throw new Error("Delete the associated plan before deleting its specification");
+      await this.tasks.storage.deleteSpec(workspace, id, memory.title);
+      delete memory.spec_archived_at;
+      memory.updated_at = new Date().toISOString();
+      await this.tasks.storage.write(workspace, memory);
+      return { deleted: true };
+    });
+  }
+
+  async archivePlan(workspace: string, id: string, archived: boolean) {
+    await this.registry.get(workspace);
+    await this.tasks.storage.read(workspace, id);
+    return this.plans.setArchived(workspace, id, archived);
+  }
+
+  async deletePlan(workspace: string, id: string) {
+    await this.registry.get(workspace);
+    await this.tasks.storage.read(workspace, id);
+    await this.plans.deleteForMemory(workspace, id);
+    return { deleted: true };
   }
 
   private async settlePlan(workspace: string, memory: TaskState, decision?: PlanDecision) {
@@ -77,6 +201,7 @@ export class MemoryControlService {
     return this.tasks.storage.workspaceLock(workspace, async () => {
       const all = await this.tasks.list(workspace); const target = all.find((item) => item.id === id);
       if (!target) throw new Error(`Unknown memory: ${id}`);
+      if (target.archived_at) throw new Error("Restore this archived memory before activating it");
       if (target.status === "completed") throw new Error("Completed memory cannot be activated");
       const current = all.find((item) => item.status === "active");
       if (current?.id === id) return target;
@@ -126,6 +251,10 @@ export class MemoryControlService {
     return this.tasks.storage.workspaceLock(workspace, async () => {
       const target = await this.tasks.storage.read(workspace, id);
       if (target.status === "completed") throw new Error("Memory is already completed");
+      const existingPlan = await this.planStorage.read(workspace, id);
+      if (existingPlan && existingPlan.status !== "completed") throw new Error("PLAN_REVIEW_REQUIRED: Complete the plan and its final code review before completing this memory");
+      if (existingPlan && (await this.plans.stateForMemory(workspace, id)).stale) throw new Error("PLAN_STALE: The completed plan is bound to an older specification");
+      if (existingPlan && !(await this.plans.inspect(workspace, id)).receipt_current) throw new Error("PLAN_REVIEW_REQUIRED: The plan review receipt is missing or stale");
       if (decision === "suspend") throw new Error("Completing memory requires abandoning an open plan");
       const previousPlan = await this.planStorage.read(workspace, id);
       let stateWriteAttempted = false;
@@ -144,6 +273,34 @@ export class MemoryControlService {
         throw error;
       }
     });
+  }
+
+  async planDetail(workspace: string, id: string) {
+    await this.registry.get(workspace);
+    await this.tasks.read(workspace, id);
+    return this.plans.inspect(workspace, id);
+  }
+
+  async planTransition(workspace: string, id: string, action: "suspend" | "reactivate" | "abandon", reason?: string) {
+    await this.registry.get(workspace);
+    return this.plans.transitionForMemory(workspace, id, action === "reactivate" ? "active" : action === "suspend" ? "suspended" : "abandoned", reason);
+  }
+
+  async planFinish(workspace: string, id: string) {
+    await this.registry.get(workspace);
+    const selected = await this.tasks.current(workspace);
+    if (selected?.id !== id) throw new Error("Select this memory before finishing its plan");
+    return this.plans.complete(workspace);
+  }
+
+  async planResolveWrite(workspace: string, id: string, repo: string, file: string, reason: string) {
+    await this.registry.get(workspace);
+    return this.plans.markWriteNotNeeded(workspace, id, repo, file, reason);
+  }
+
+  async planAllowMarker(workspace: string, id: string, repo: string, file: string, reason: string) {
+    await this.registry.get(workspace);
+    return this.plans.allowFinalMarker(workspace, id, repo, file, reason);
   }
 
   async phase(workspace: string, id: string, phase: string) {

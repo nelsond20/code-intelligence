@@ -1,6 +1,9 @@
-import { atomicWrite, readTextIfExists } from "../shared/fs.js";
+import { atomicWrite, purgeDirectory, readTextIfExists } from "../shared/fs.js";
 import { TaskStorage } from "../task-state/storage.js";
 import { planStateSchema, type PlanState } from "./schemas.js";
+import path from "node:path";
+import crypto from "node:crypto";
+import { rm } from "node:fs/promises";
 
 export class PlanStorage {
   constructor(readonly tasks = new TaskStorage()) {}
@@ -19,5 +22,19 @@ export class PlanStorage {
       if (previous !== undefined) await atomicWrite(`${target}.backup`, previous);
       await atomicWrite(target, `${JSON.stringify(parsed, null, 2)}\n`);
     });
+  }
+
+  async archiveTerminal(workspaceId: string, plan: PlanState): Promise<void> {
+    if (plan.status !== "completed" && plan.status !== "abandoned") throw new Error("Only terminal plans can be archived");
+    const parsed = planStateSchema.parse(plan);
+    const fingerprint = crypto.createHash("sha256").update(JSON.stringify(parsed)).digest("hex").slice(0, 16);
+    const file = path.join(this.tasks.taskPath(workspaceId, plan.memory_id), "plan-history", `${fingerprint}.json`);
+    await atomicWrite(file, `${JSON.stringify(parsed, null, 2)}\n`);
+  }
+
+  async delete(workspaceId: string, memoryId: string): Promise<void> {
+    await purgeDirectory(path.join(this.tasks.taskPath(workspaceId, memoryId), "plan-history"));
+    await rm(this.path(workspaceId, memoryId), { force: true });
+    await rm(`${this.path(workspaceId, memoryId)}.backup`, { force: true });
   }
 }

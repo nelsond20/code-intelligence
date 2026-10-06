@@ -6,6 +6,7 @@ import { GitBackend } from "../broker/git-backend.js";
 import { parseContextRef } from "../broker/refs.js";
 import { PlanService } from "../plan/service.js";
 import { parseMemoryAction, type ContextFindInput, type ContextInspectInput, type MemoryInput, type PlanInput } from "./schemas.js";
+import { deriveStage } from "../orchestration/stage.js";
 
 export class ToolRuntime {
   clientName?: () => string | undefined;
@@ -16,6 +17,10 @@ export class ToolRuntime {
 
   private planClient(): "opencode" | "unknown" {
     return /opencode/i.test(this.clientName?.() || "") ? "opencode" : "unknown";
+  }
+
+  private async withStage<T extends object>(workspaceId: string, data: T) {
+    return { ...data, ...await deriveStage(this.plans, workspaceId) };
   }
 
   async workspaceId(): Promise<string> {
@@ -54,37 +59,35 @@ export class ToolRuntime {
       parseMemoryAction(input);
       const active = await this.tasks.current(workspaceId);
       if (!active) throw new Error("NO_ACTIVE_MEMORY: Memory selection is controlled by the operator in the local control plane.");
-      return { active: true, memory: await this.tasks.read(workspaceId, active.id), active_plan: await this.plans.current(workspaceId, this.planClient()) };
+      return this.withStage(workspaceId, { active: true, memory: await this.tasks.read(workspaceId, active.id), active_plan: await this.plans.current(workspaceId, this.planClient()) });
     }
     if (input.action === "note") {
       const value = parseMemoryAction(input) as { action: "note"; type: "observation" | "evidence" | "hypothesis" | "decision" | "question" | "blocker"; text: string;
         confidence: "low" | "medium" | "high"; evidence_refs: string[]; repo?: string; file?: string; symbol?: string };
       const state = await this.tasks.note(workspaceId, { type: value.type, text: value.text, confidence: value.confidence,
         evidence_refs: value.evidence_refs, repo: value.repo, file: value.file, symbol: value.symbol });
-      return { saved: true, memory_id: state.id, record_id: state.records[0]!.id, record_status: state.records[0]!.status, note_type: input.type, updated_at: state.updated_at };
+      return this.withStage(workspaceId, { saved: true, record_id: state.records[0]!.id, record_status: state.records[0]!.status, note_type: input.type, updated_at: state.updated_at });
     }
     if (input.action === "resolve") {
       const value = parseMemoryAction(input) as { action: "resolve"; record_id: string; status: "observed" | "supported" | "confirmed" | "superseded" | "rejected" | "resolved" | "ruled_out"; reason: string; evidence_refs: string[] };
       const state = await this.tasks.resolve(workspaceId, value.record_id, value.status, value.reason, value.evidence_refs);
       const record = state.records.find((item) => item.id === input.record_id)!;
-      return { memory_id: state.id, record_id: record.id, record_status: record.status, evidence_refs: record.evidence_refs, updated_at: record.updated_at };
+      return this.withStage(workspaceId, { record_id: record.id, record_status: record.status, evidence_refs: record.evidence_refs, updated_at: record.updated_at });
     }
     if (input.action === "spec_set") {
       const value = parseMemoryAction(input) as { action: "spec_set"; summary: string; requirements: Array<{ id?: string; statement: string; kind: "behavior" | "constraint"; priority: "must" | "should" }> };
-      return this.tasks.setSpec(workspaceId, { summary: value.summary, requirements: value.requirements });
+      const result = await this.tasks.setSpec(workspaceId, { summary: value.summary, requirements: value.requirements });
+      return this.withStage(workspaceId, result);
     }
     throw new Error(`Unsupported memory action: ${(input as { action?: string }).action || "unknown"}`);
   }
 
   async plan(input: PlanInput) {
     const workspaceId = await this.workspaceId();
-    if (input.action === "current") return this.plans.current(workspaceId, this.planClient());
-    if (input.action === "create") { await this.plans.create(workspaceId, input.steps, input.exceptions); return this.plans.current(workspaceId, this.planClient()); }
-    if (input.action === "complete") return this.plans.complete(workspaceId);
-    if (input.action === "revise") { await this.plans.reviseOperations(workspaceId, input.reason, input.operations); return this.plans.current(workspaceId, this.planClient()); }
-    if (input.action === "suspend") { await this.plans.transition(workspaceId, "suspended", input.reason); return this.plans.current(workspaceId, this.planClient()); }
-    if (input.action === "reactivate") { await this.plans.transition(workspaceId, "active"); return this.plans.current(workspaceId, this.planClient()); }
-    if (input.action === "abandon") { await this.plans.transition(workspaceId, "abandoned", input.reason); return this.plans.current(workspaceId, this.planClient()); }
+    if (input.action === "current") return this.withStage(workspaceId, await this.plans.current(workspaceId, this.planClient()));
+    if (input.action === "create") { await this.plans.createCompact(workspaceId, input.steps); return this.withStage(workspaceId, await this.plans.current(workspaceId, this.planClient())); }
+    if (input.action === "complete_current") return this.withStage(workspaceId, await this.plans.completeCurrent(workspaceId));
+    if (input.action === "revise_current") { await this.plans.reviseCurrentCompact(workspaceId, input.reason, input.step); return this.withStage(workspaceId, await this.plans.current(workspaceId, this.planClient())); }
     throw new Error(`Unsupported plan action: ${(input as { action: string }).action}`);
   }
 }

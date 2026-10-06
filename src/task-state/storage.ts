@@ -1,6 +1,6 @@
 import path from "node:path";
 import { readdir, rm } from "node:fs/promises";
-import { atomicWrite, readTextIfExists, withFileLock } from "../shared/fs.js";
+import { atomicWrite, purgeDirectory, readTextIfExists, withFileLock } from "../shared/fs.js";
 import { structuredSpecSchema, taskStateSchema, type StructuredSpec, type TaskState } from "./schemas.js";
 import { appPaths, assertSafeId } from "../workspace/paths.js";
 
@@ -88,7 +88,11 @@ export class TaskStorage {
     }
     const corrupt_entries: Array<{ id: string; error: string }> = [];
     const states = await Promise.all(entries.sort().filter((id) => !id.startsWith(".")).map(async (id) => {
-      try { return await this.read(workspaceId, id); } catch (error) { corrupt_entries.push({ id, error: (error as Error).message }); return undefined; }
+      try {
+        if (await readTextIfExists(path.join(this.taskPath(workspaceId, id), ".deleted")) !== undefined
+          && await readTextIfExists(this.statePath(workspaceId, id)) === undefined) return undefined;
+        return await this.read(workspaceId, id);
+      } catch (error) { corrupt_entries.push({ id, error: (error as Error).message }); return undefined; }
     }));
     return { memories: states.filter((state): state is TaskState => state !== undefined)
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at)), corrupt_entries };
@@ -114,6 +118,7 @@ export class TaskStorage {
       await atomicWrite(this.findingsPath(workspaceId, state.id), `# Findings — ${state.title}\n\nUseful investigation knowledge only; no raw conversation or private reasoning.\n`);
       await atomicWrite(this.specPath(workspaceId, state.id), `# Specification — ${state.title}\n\nConfirmed design and implementation conclusions are recorded here.\n`);
     });
+    await rm(path.join(this.taskPath(workspaceId, state.id), ".deleted"), { force: true });
   }
 
   async appendFinding(workspaceId: string, taskId: string, content: string): Promise<void> {
@@ -158,6 +163,35 @@ export class TaskStorage {
   async readPlan(workspaceId: string, taskId: string): Promise<string | undefined> {
     await this.recoverTransaction(workspaceId, taskId);
     return readTextIfExists(this.planPath(workspaceId, taskId));
+  }
+
+  async removeFinding(workspaceId: string, taskId: string, record: TaskState["records"][number]): Promise<void> {
+    const file = this.findingsPath(workspaceId, taskId);
+    const content = await readTextIfExists(file);
+    if (content === undefined) return;
+    const heading = `## ${record.kind[0]!.toUpperCase()}${record.kind.slice(1)} — ${record.created_at}\n\n${record.text}`;
+    const start = content.indexOf(heading);
+    if (start < 0) throw new Error(`Finding entry for ${record.id} was not found; note was not deleted`);
+    const next = content.indexOf("\n\n## ", start + heading.length);
+    const before = content.slice(0, start).trimEnd();
+    const after = next < 0 ? "" : content.slice(next + 2).trim();
+    await atomicWrite(file, `${before}${after ? `\n\n${after}` : ""}\n`);
+  }
+
+  async deleteSpec(workspaceId: string, taskId: string, title: string): Promise<void> {
+    const revisions = path.join(this.taskPath(workspaceId, taskId), "spec-revisions");
+    await purgeDirectory(revisions);
+    await rm(this.specStatePath(workspaceId, taskId), { force: true });
+    await rm(`${this.specStatePath(workspaceId, taskId)}.backup`, { force: true });
+    await atomicWrite(this.specPath(workspaceId, taskId), `# Specification — ${title}\n\nConfirmed design and implementation conclusions are recorded here.\n`);
+    await rm(`${this.specPath(workspaceId, taskId)}.backup`, { force: true });
+  }
+
+  async deleteTask(workspaceId: string, taskId: string): Promise<void> {
+    const target = this.taskPath(workspaceId, taskId);
+    await purgeDirectory(target);
+    try { await readdir(target); await atomicWrite(path.join(target, ".deleted"), "deleted\n"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
 
   async workspaceLock<T>(workspaceId: string, action: () => Promise<T>): Promise<T> {
