@@ -15,20 +15,25 @@ const requirementInput = desiredRequirementInput.extend({
   id: desiredRequirementInput.shape.id.describe("Optional. Omit for a new requirement; only reuse a server-issued R* ID from this memory's current specification."),
 });
 export const memoryInput = z.object({
-  action: z.enum(["current", "note", "resolve", "spec_set"]).describe("Choose current, note, resolve, or spec_set. Every action uses the operator-selected active memory."),
+  action: z.enum(["current", "note", "resolve", "spec_set"]).describe("READ: current reads the active memory, spec, and records (including continuation). WRITE: note saves a durable finding; resolve updates a memory record; spec_set replaces the complete desired spec and never reads records. Every action uses the operator-selected active memory."),
   type: taskNoteTypeSchema.exclude(["hypothesis_rejected"]).optional(),
   text: z.string().trim().min(1).max(20_000).optional(),
   confidence: confidenceSchema.optional(),
-  evidence_refs: z.array(z.string().min(1).max(4_000)).max(50).optional(),
+  evidence_refs: z.array(z.string().min(1).max(4_000)).max(50).optional().describe("For note/resolve only: context refs returned by context.find and inspected with context.inspect in this memory. M* memory record IDs are not evidence refs."),
   repo: z.string().optional(), file: z.string().optional(), symbol: z.string().optional(),
-  record_id: z.string().min(1).optional(), status: memoryRecordStatusSchema.optional(),
+  record_id: z.string().min(1).optional().describe("For resolve only: server-issued M* memory record ID; never use it in evidence_refs."), status: memoryRecordStatusSchema.optional(),
   reason: z.string().trim().min(1).max(2_000).optional(),
-  summary: z.string().trim().min(1).max(50_000).optional().describe("Required for spec_set: summary of the complete desired specification."),
-  requirements: z.array(requirementInput).min(1).max(500).optional().describe("Required for spec_set: complete desired list. Each item requires statement, kind, and priority; omit id for a new item."),
+  summary: z.string().trim().min(1).max(50_000).optional().describe("Required for spec_set WRITE: summary of the complete desired specification; never use spec_set to read."),
+  requirements: z.array(requirementInput).min(1).max(500).optional().describe("Required for spec_set WRITE: complete desired list. Each item requires statement, kind, and priority; omit id for a new item. Never use spec_set to retrieve requirements."),
+  section: z.enum(["records", "requirements", "summary", "metadata", "item"]).optional().describe("ONLY for current READ continuation; selects records, requirements, summary, metadata, or one item. Never use with spec_set."),
+  offset: z.number().int().min(0).optional().describe("ONLY for current READ continuation; page offset. Never use with spec_set."),
+  state_token: z.string().length(64).optional().describe("ONLY for current READ continuation; obtain from memory.current. Never use with spec_set."),
+  item_id: z.string().optional().describe("ONLY for current READ continuation with section=item; M* record or R* requirement ID."),
 }).strict();
 
 const memoryActions = {
-  current: z.object({ action: z.literal("current") }).strict(),
+  current: z.object({ action: z.literal("current"), section: z.enum(["records", "requirements", "summary", "metadata", "item"]).optional(),
+    offset: z.number().int().min(0).optional(), state_token: z.string().length(64).optional(), item_id: z.string().optional() }).strict(),
   note: z.object({ action: z.literal("note"), type: taskNoteTypeSchema.exclude(["hypothesis_rejected"]), text: z.string().trim().min(1).max(20_000),
     confidence: confidenceSchema.default("medium"), evidence_refs: z.array(z.string().min(1).max(4_000)).max(50).default([]),
     repo: z.string().optional(), file: z.string().optional(), symbol: z.string().optional() }).strict(),
@@ -42,24 +47,14 @@ export function parseMemoryAction(input: z.infer<typeof memoryInput>) {
   const action = memoryInput.shape.action.parse(input?.action);
   return memoryActions[action].parse(input);
 }
-const requirementId = z.string().regex(/^R[1-9][0-9]*$/);
 export const compactPlanStep = z.object({
-  kind: z.enum(["implementation", "investigation", "verification"]).describe("Implementation requires writes; investigation and verification forbid writes."),
   title: z.string().trim().min(1).max(500), objective: z.string().trim().min(1).max(4_000),
-  covers: z.array(requirementId).min(1).max(50).describe("R* requirement IDs from the active structured specification."),
-  writes: z.array(z.object({ repo: z.string().min(1), path: z.string().min(1).max(4_000), purpose: z.string().trim().min(1).max(2_000).optional() }).strict()).max(20).optional(),
-  multi_file_justification: z.string().trim().min(1).max(2_000).optional(),
-  context: z.array(z.object({ repo: z.string().min(1), file: z.string().min(1).max(4_000), symbol: z.string().min(1).max(1_000).optional(), hint: z.string().min(1).max(2_000).optional() }).strict()).max(30).optional(),
-  acceptance: z.array(z.string().trim().min(1).max(2_000)).min(1).max(30),
-  verification: z.array(z.object({ kind: z.enum(["test", "typecheck", "lint", "build", "custom"]), program: z.string().trim().min(1).max(200),
-    args: z.array(z.string().max(2_000)).max(100), repo: z.string().min(1).optional(), cwd: z.string().max(4_000).optional(), expect_exit: z.number().int().min(0).max(255).optional() }).strict()).min(1).max(20),
-}).strict().superRefine((step, context) => {
-  if (step.kind === "implementation" && !step.writes?.length) context.addIssue({ code: z.ZodIssueCode.custom, path: ["writes"], message: "implementation requires writes" });
-  if (step.kind !== "implementation" && step.writes?.length) context.addIssue({ code: z.ZodIssueCode.custom, path: ["writes"], message: `${step.kind} forbids writes` });
-  if ((step.writes?.length || 0) >= 3 && !step.multi_file_justification) context.addIssue({ code: z.ZodIssueCode.custom, path: ["multi_file_justification"], message: "3 or more writes require justification" });
-});
+  writes: z.array(z.string().min(1).max(4_000)).max(20).optional(),
+  repo: z.string().min(1).optional().describe("Optional registered repository ID for unqualified write paths. Repo-prefixed and absolute write paths resolve from registered repositories."),
+}).strict();
 export const planInput = z.discriminatedUnion("action", [
-  z.object({ action: z.literal("current") }).strict(),
+  z.object({ action: z.literal("current"), section: z.enum(["writes", "context", "acceptance", "verification", "item"]).optional(),
+    offset: z.number().int().min(0).optional(), state_token: z.string().length(64).optional(), item_id: z.string().optional() }).strict(),
   z.object({ action: z.literal("create"), steps: z.array(compactPlanStep).min(1).max(50) }).strict(),
   z.object({ action: z.literal("complete_current") }).strict(),
   z.object({ action: z.literal("revise_current"), reason: z.string().trim().min(1).max(2_000), step: compactPlanStep }).strict(),
@@ -69,4 +64,9 @@ export type ContextFindInput = z.input<typeof contextFindInput>;
 export type ContextInspectInput = z.input<typeof contextInspectInput>;
 export type MemoryInput = z.input<typeof memoryInput>;
 export type CompactPlanStep = z.input<typeof compactPlanStep>;
-export type PlanInput = z.input<typeof planInput>;
+// Direct in-process callers may still use the historical step shape. MCP validates planInput.
+type LegacyStep = { kind?: "implementation" | "investigation" | "verification"; title: string; objective: string; covers?: string[];
+  writes?: Array<{ repo: string; path: string }>; acceptance?: string[];
+  verification?: Array<{ kind: "test" | "typecheck" | "lint" | "build" | "custom"; program: string; args: string[]; repo?: string }> };
+export type PlanInput = z.input<typeof planInput> | { action: "create"; steps: LegacyStep[] }
+  | { action: "revise_current"; reason: string; step: LegacyStep };

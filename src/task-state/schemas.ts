@@ -13,7 +13,7 @@ export const requirementSchema = z.object({
 export const desiredRequirementInput = requirementSchema.omit({ id: true }).extend({ id: requirementSchema.shape.id.optional() }).strict();
 export const structuredSpecSchema = z.object({
   revision: z.number().int().min(1), summary: z.string().trim().min(1).max(50_000), requirements: z.array(requirementSchema).min(1).max(500),
-  reason: z.string().max(2_000).optional(), created_at: z.string(),
+  reason: z.string().max(2_000).optional(), created_at: z.string(), archived_at: z.string().optional(),
 });
 const memoryRecordSchema = z.object({
   id: z.string(), kind: z.enum(["observation", "evidence", "hypothesis", "decision", "question", "blocker"]),
@@ -37,6 +37,7 @@ export const taskStateSchema = z.object({
   phase: z.string(),
   objective: z.string(),
   confirmed_findings: z.array(z.string()),
+  supported_findings: z.array(z.string()).default([]),
   active_hypotheses: z.array(hypothesisSchema),
   rejected_hypotheses: z.array(hypothesisSchema.extend({ reason: z.string().optional() })),
   open_questions: z.array(z.string()),
@@ -51,7 +52,9 @@ export const taskStateSchema = z.object({
   next_record_id: z.number().int().min(1).optional(),
   archived_at: z.string().optional(),
   spec_archived_at: z.string().optional(),
-  outcome: z.object({ summary: z.string(), limitations: z.array(z.string()), evidence_refs: z.array(z.string()), completed_at: z.string() }).optional(),
+  outcome: z.object({ summary: z.string(), limitations: z.array(z.string()), evidence_refs: z.array(z.string()),
+    modified_paths: z.array(z.string()).default([]), verifications: z.array(z.string()).default([]),
+    provenance_version: z.literal(2).optional(), legacy_unclassified: z.array(z.string()).optional(), completed_at: z.string() }).optional(),
   created_at: z.string(),
   updated_at: z.string(),
 });

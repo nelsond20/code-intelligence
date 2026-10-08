@@ -1,6 +1,10 @@
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdir } from "node:fs/promises";
+import { gzipSync, gunzipSync } from "node:zlib";
 import path from "node:path";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { RepositoryAccessPolicy } from "../privacy/repository-access.js";
 import { TaskService } from "../task-state/service.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
@@ -10,14 +14,16 @@ import { appPaths } from "../workspace/paths.js";
 import { atomicWrite, readTextIfExists } from "../shared/fs.js";
 import { walkReadableFiles } from "../search/files.js";
 import { canonicalTarget } from "./target-path.js";
+import { PlanRepositoryError } from "./repository-error.js";
 import { planBindingStale, structuredSpecHash } from "./binding.js";
 import { cumulativeCodeHash, reviewReceiptCurrent } from "./review-state.js";
 import type { CompactPlanStep } from "../mcp/schemas.js";
 
-function expandCompactStep(step: CompactPlanStep): PlanStepInput {
-  return { ...step, writes: (step.writes || []).map((write) => ({ ...write, covers: step.covers })), context: step.context || [],
-    acceptance: step.acceptance.map((statement) => ({ statement, covers: step.covers })), verification: step.verification };
-}
+type LegacyCompactStep = { kind?: "implementation" | "investigation" | "verification"; title: string; objective: string;
+  covers?: string[]; writes?: Array<{ repo: string; path: string }>; acceptance?: string[];
+  verification?: Array<{ kind: "test" | "typecheck" | "lint" | "build" | "custom"; program: string; args: string[]; repo?: string }> };
+
+const execFileAsync = promisify(execFile);
 function hasConfirmedSpec(spec: string): boolean {
   return spec.split(/\r?\n/).some((line) => {
     const value = line.trim();
@@ -51,8 +57,164 @@ async function contentHash(file: string): Promise<string | undefined> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 }
 
+type ShellWork = { scans: number; stats: number; hashes: number; snapshot_bytes: number };
+type WriteState = { kind: "file" | "missing" | "other"; hash?: string };
+type WriteSnapshot = { repo: string; path: string; state: WriteState };
+const writeKey = (item: { repo: string; path: string }) => `${item.repo}:${item.path}`;
+const sameState = (a: WriteState, b: WriteState) => a.kind === b.kind && a.hash === b.hash;
+
+async function shellMetadata(registry: WorkspaceRegistry, workspaceId: string, work: ShellWork): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  const workspace = await registry.get(workspaceId);
+  for (const repository of workspace.repositories) {
+    work.scans++;
+    for (const relative of await walkReadableFiles(repository.path)) {
+      try {
+        const info = await stat(path.join(repository.path, relative), { bigint: true }); work.stats++;
+        files.set(`${repository.id}:${relative}`, `${info.dev}:${info.ino}:${info.mode}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`);
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+  }
+  return files;
+}
+
 export class PlanService {
   constructor(readonly storage = new PlanStorage(), readonly tasks = new TaskService(storage.tasks), readonly registry = new WorkspaceRegistry()) {}
+
+  private async snapshotWrites(workspaceId: string, step: PlanStep): Promise<WriteSnapshot[]> {
+    return Promise.all(step.writes.map(async (write) => {
+      let repository;
+      try { repository = await this.registry.resolveRepository(workspaceId, write.repo); }
+      catch (error) { throw new PlanRepositoryError("PLAN_REPOSITORY_RESOLUTION_FAILED", "Resolve repository for write baseline", write.repo, write.path, error); }
+      const file = path.join(repository.path, write.path);
+      try {
+        let info;
+        try { info = await lstat(file); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            await canonicalTarget(repository.path, write.path, true);
+            return { repo: write.repo, path: write.path, state: { kind: "missing" as const } };
+          }
+          throw error;
+        }
+        // Revalidate containment and the repository read policy at observation time.
+        if (info.isSymbolicLink() || !info.isFile()) return { repo: write.repo, path: write.path, state: { kind: "other" as const } };
+        await canonicalTarget(repository.path, write.path, false);
+        const hash = await contentHash(file);
+        if (hash === undefined) throw new Error(`Declared write disappeared during observation: ${write.repo}:${write.path}`);
+        return { repo: write.repo, path: write.path, state: { kind: "file" as const, hash } };
+      } catch (error) {
+        if (error instanceof PlanRepositoryError) throw error;
+        throw new PlanRepositoryError("PLAN_BASELINE_FAILED", "Capture write baseline", write.repo, write.path, error);
+      }
+    }));
+  }
+
+  private async snapshotRepositories(workspaceId: string, steps: PlanStep[]): Promise<NonNullable<PlanState["repository_baseline"]>> {
+    const ids = new Set(steps.flatMap((step) => step.writes.map((write) => write.repo)));
+    const result: NonNullable<PlanState["repository_baseline"]> = [];
+    for (const repo of ids) {
+      let relative: string | undefined;
+      try {
+        const repository = await this.registry.resolveRepository(workspaceId, repo);
+        const files: Array<{ path: string; hash: string }> = [];
+        for (relative of await walkReadableFiles(repository.path)) {
+          const hash = await contentHash(path.join(repository.path, relative));
+          if (hash === undefined) throw new Error("Repository file disappeared during plan baseline");
+          files.push({ path: relative, hash });
+        }
+        result.push({ repo, files });
+      } catch (error) {
+        throw new PlanRepositoryError("PLAN_BASELINE_FAILED", "Capture repository baseline", repo, relative, error);
+      }
+    }
+    return result;
+  }
+
+  private creationBaseline(plan: PlanState, write: { repo: string; path: string }): WriteSnapshot | undefined {
+    const repository = plan.repository_baseline?.find((item) => item.repo === write.repo);
+    if (!repository) return undefined;
+    const file = repository.files.find((item) => item.path === write.path);
+    return { repo: write.repo, path: write.path, state: file ? { kind: "file", hash: file.hash } : { kind: "missing" } };
+  }
+
+  private async beginStep(workspaceId: string, step: PlanStep): Promise<void> {
+    if (step.kind === "implementation") step.write_baseline = await this.snapshotWrites(workspaceId, step);
+  }
+
+  private async configuredChecks(workspaceId: string, step: PlanStep): Promise<Array<{ id: string; command_display: string }>> {
+    if (step.kind !== "implementation") return [];
+    const workspace = await this.registry.get(workspaceId);
+    const repository = workspace.repositories.find((item) => item.id === step.writes[0]?.repo);
+    if (!repository) return [];
+    let scripts: Record<string, string> = {};
+    try { scripts = (JSON.parse(await readFile(path.join(repository.path, "package.json"), "utf8")) as { scripts?: Record<string, string> }).scripts || {}; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    return workspace.verification.filter((id) => !!scripts[id]).map((id) => ({ id, command_display: `npm run ${id}` }));
+  }
+
+  private async repositoryFingerprint(root: string): Promise<string> {
+    const hash = crypto.createHash("sha256");
+    for (const file of (await walkReadableFiles(root)).sort())
+      hash.update(file).update("\0").update(await readFile(path.join(root, file))).update("\0");
+    return hash.digest("hex");
+  }
+
+  private async runConfiguredChecks(workspaceId: string, step: PlanStep, plan: PlanState): Promise<string[]> {
+    const checks = await this.configuredChecks(workspaceId, step);
+    if (!checks.length) return [];
+    const repository = await this.registry.resolveRepository(workspaceId, step.writes[0]!.repo);
+    const content_hash = await this.repositoryFingerprint(repository.path);
+    const failures: string[] = [];
+    for (const check of checks) {
+      const existing = step.check_receipts?.find((item) => item.id === check.id && item.content_hash === content_hash && item.exit_code === 0);
+      if (existing) continue;
+      const isolatedHome = path.join(appPaths().dataDir, "verification-home");
+      await mkdir(isolatedHome, { recursive: true, mode: 0o700 });
+      let exit_code = 0; let output = "";
+      try {
+        const result = await execFileAsync("npm", ["run", check.id], { cwd: repository.path,
+          env: { ...process.env, HOME: isolatedHome, XDG_CONFIG_HOME: path.join(isolatedHome, ".config"),
+            npm_config_userconfig: path.join(isolatedHome, ".npmrc"),
+            npm_config_cache: path.join(appPaths().dataDir, "npm-cache"), npm_config_logs_max: "0" },
+          timeout: 120_000, maxBuffer: 256_000 });
+        output = `${result.stdout}\n${result.stderr}`.slice(-8_000);
+      } catch (error) {
+        const failure = error as Error & { code?: number; stdout?: string; stderr?: string };
+        exit_code = typeof failure.code === "number" ? failure.code : 1;
+        output = `${failure.stdout || ""}\n${failure.stderr || failure.message}`.slice(-8_000);
+      }
+      if (await this.repositoryFingerprint(repository.path) !== content_hash) { exit_code = 1; output += "\nRepository content changed during verification"; }
+      step.check_receipts = [...(step.check_receipts || []).filter((item) => item.id !== check.id), { id: check.id, content_hash, exit_code, output }];
+      if (exit_code !== 0) failures.push(`${check.command_display} failed (exit ${exit_code}): ${output}`);
+    }
+    if (failures.length) { plan.updated_at = new Date().toISOString(); await this.storage.write(workspaceId, plan); }
+    return failures;
+  }
+
+  private async reconcileWrites(workspaceId: string, plan: PlanState, step: PlanStep): Promise<{ current: WriteSnapshot[]; changed: WriteSnapshot[] }> {
+    if (!step.write_baseline || step.write_baseline.length !== step.writes.length)
+      throw new Error(`STEP_NOT_COMPLETE: ${step.id} has no server-owned write baseline; revise the current step before editing`);
+    const current = await this.snapshotWrites(workspaceId, step);
+    const baseline = new Map(step.write_baseline.map((item) => [writeKey(item), item.state]));
+    const planBaseline = new Map(step.plan_baseline?.map((item) => [writeKey(item), item.state]) || []);
+    const changed = current.filter((item) => {
+      const before = baseline.get(writeKey(item));
+      const initial = planBaseline.get(writeKey(item));
+      return item.state.kind === "file" && [before, initial].some((state) => state &&
+        (state.kind === "missing" || state.kind === "file" && state.hash !== item.state.hash));
+    });
+    const observed = new Set(step.modified_paths.map(writeKey));
+    const newlyObserved = changed.filter((item) => !observed.has(writeKey(item)));
+    if (newlyObserved.length) {
+      step.mutation_generation += 1;
+      step.modified_paths.push(...newlyObserved.map(({ repo, path: targetPath }) => ({ repo, path: targetPath })));
+      step.verification = step.verification.map(({ verified_generation: _generation, last_exit: _exit, write_states: _states, ...verification }) => verification);
+      await this.markIndexDirty(workspaceId, newlyObserved);
+      plan.last_mutation_at = new Date().toISOString(); delete plan.review_receipt;
+    }
+    return { current, changed };
+  }
 
   private async guardStatus(workspaceId: string, integration: "opencode" | "unknown"): Promise<"enforced" | "degraded" | "unavailable"> {
     if (integration === "unknown") return "unavailable";
@@ -81,47 +243,57 @@ export class PlanService {
   }
 
   private async spec(workspaceId: string, memoryId: string): Promise<string> {
+    if ((await this.storage.tasks.read(workspaceId, memoryId)).spec_archived_at) throw new Error("Restore or replace the archived specification before planning");
     const spec = await this.storage.tasks.readSpec(workspaceId, memoryId);
     if (!hasConfirmedSpec(spec)) throw new Error("A non-empty confirmed spec is required before creating or revising a plan");
     return spec;
   }
 
-  private async assertCoverage(workspaceId: string, memoryId: string, steps: PlanStep[], exceptions: Array<{ requirement_id: string; reason: string }> = []): Promise<void> {
-    const spec = await this.storage.tasks.readStructuredSpec(workspaceId, memoryId);
-    if (!spec) return;
-    const requirements = new Map(spec.requirements.map((item) => [item.id, item]));
-    const exceptionIds = new Set(exceptions.map((item) => item.requirement_id));
-    for (const exception of exceptions) if (!requirements.has(exception.requirement_id)) throw new Error(`Exception references unknown requirement ${exception.requirement_id}`);
-    const covered = new Set<string>();
-    for (const [stepIndex, step] of steps.entries()) {
-      for (const requirement of step.covers) {
-        if (!requirements.has(requirement)) throw new Error(`Step ${step.id} covers unknown requirement ${requirement}`);
-        covered.add(requirement);
-      }
-      if (step.covers.length === 0) throw new Error(`Step ${step.id} does not cover a requirement at steps[${stepIndex}].covers; use covers with R* IDs from the active spec: ${[...requirements.keys()].join(", ")}`);
-      for (const [writeIndex, write] of step.writes.entries()) {
-        if (write.covers.length === 0) throw new Error(`Write ${write.repo}:${write.path} has no requirement coverage at steps[${stepIndex}].writes[${writeIndex}].covers; use a subset of step covers: ${step.covers.join(", ")}`);
-        for (const requirement of write.covers) if (!step.covers.includes(requirement)) throw new Error(`Write ${write.repo}:${write.path} covers ${requirement} outside step ${step.id}`);
-      }
-      for (const [acceptanceIndex, acceptance] of step.acceptance.entries()) {
-        if (!acceptance.covers.length) throw new Error(`Step ${step.id} has an acceptance criterion without requirement coverage at steps[${stepIndex}].acceptance[${acceptanceIndex}].covers; use an object with statement and covers (legacy strings cannot cover a structured spec). Expected a subset of: ${step.covers.join(", ")}`);
-        for (const requirement of acceptance.covers) if (!step.covers.includes(requirement)) throw new Error(`Acceptance ${acceptance.id} covers ${requirement} outside step ${step.id}`);
-        if (!acceptance.verification_ids.length) throw new Error(`Acceptance ${acceptance.id} has no verification`);
-        for (const verificationId of acceptance.verification_ids) if (!step.verification.some((item) => item.id === verificationId)) throw new Error(`Acceptance ${acceptance.id} references unknown verification ${verificationId}`);
-      }
+  private async compactInput(workspaceId: string, step: CompactPlanStep | LegacyCompactStep): Promise<PlanStepInput> {
+    if (step.writes?.some((item) => typeof item !== "string") || "kind" in step) {
+      const legacy = step as LegacyCompactStep;
+      return { title: legacy.title, objective: legacy.objective, kind: legacy.kind || (legacy.writes?.length ? "implementation" : "investigation"),
+        covers: legacy.covers || [], writes: (legacy.writes || []).map((write) => ({ ...write, covers: legacy.covers || [] })),
+        acceptance: (legacy.acceptance || []).map((statement) => ({ statement, covers: legacy.covers || [] })), verification: legacy.verification || [] };
     }
-    const missing = spec.requirements.filter((item) => item.priority === "must" && !covered.has(item.id) && !exceptionIds.has(item.id));
-    if (missing.length) throw new Error(`Must requirements without plan coverage: ${missing.map((item) => item.id).join(", ")}`);
-    const behavior = spec.requirements.filter((item) => item.kind === "behavior" && item.priority === "must" && covered.has(item.id));
-    for (const requirement of behavior) {
-      if (!steps.some((step) => step.covers.includes(requirement.id) && step.verification.some((verification) => verification.kind === "test"))) {
-        throw new Error(`Behavior requirement ${requirement.id} requires a test verification; add verification with kind: "test" to a step whose covers includes ${requirement.id}`);
-      }
-    }
+    const repositories = (await this.registry.get(workspaceId)).repositories;
+    const explicit = "repo" in step && typeof step.repo === "string" ? repositories.find((repo) => repo.id === step.repo) : undefined;
+    if ("repo" in step && step.repo && !explicit) throw new Error("Repository ID is not registered in the active workspace");
+    return { title: step.title, objective: step.objective, kind: step.writes?.length ? "implementation" : "investigation",
+      writes: ((step as CompactPlanStep).writes || []).map((requested) => {
+        const normalized = requested.replaceAll("\\", "/");
+        const absolute = path.isAbsolute(normalized);
+        const matches = absolute
+          ? repositories.filter((repo) => normalized.startsWith(`${repo.path}${path.sep}`))
+          : repositories.filter((repo) => normalized.startsWith(`${repo.id}/`) || normalized.startsWith(`${path.basename(repo.path)}/`));
+        const deepest = Math.max(0, ...matches.map((repo) => repo.path.length));
+        const candidates = absolute ? matches.filter((repo) => repo.path.length === deepest) : matches;
+        if (absolute && !candidates.length && !explicit) throw new Error("Path escapes the repository");
+        if (candidates.length > 1) throw new PlanRepositoryError("PLAN_WRITE_REPOSITORY_AMBIGUOUS", "Resolve write owner", undefined,
+          absolute ? undefined : normalized);
+        const owner = candidates[0] || explicit || (repositories.length === 1 ? repositories[0] : undefined);
+        if (!owner) throw new PlanRepositoryError("PLAN_WRITE_REPOSITORY_REQUIRED", "Resolve write owner", undefined,
+          absolute ? undefined : normalized);
+        if (explicit && candidates[0] && candidates[0].id !== explicit.id)
+          throw new PlanRepositoryError("PLAN_WRITE_REPOSITORY_AMBIGUOUS", "Resolve write owner", explicit.id,
+            absolute ? undefined : normalized);
+        const prefixes = [`${owner.id}/`, `${path.basename(owner.path)}/`];
+        const prefix = absolute ? undefined : prefixes.find((value) => normalized.startsWith(value));
+        return { repo: owner.id, path: absolute && candidates[0]
+          ? path.relative(owner.path, normalized).replaceAll(path.sep, "/")
+          : prefix ? normalized.slice(prefix.length) : requested };
+      }),
+      acceptance: [], verification: [] };
   }
 
   private async canonicalPath(workspaceId: string, repo: string, requested: string, allowMissing = true): Promise<string> {
-    const repository = await this.registry.resolveRepository(workspaceId, repo);
+    let repository;
+    try { repository = await this.registry.resolveRepository(workspaceId, repo); }
+    catch (error) {
+      if (error instanceof Error && error.message.startsWith("Unknown repository")) throw error;
+      throw new PlanRepositoryError("PLAN_REPOSITORY_RESOLUTION_FAILED", "Resolve repository for write", repo,
+        path.isAbsolute(requested) ? undefined : requested, error);
+    }
     return canonicalTarget(repository.path, requested, allowMissing);
   }
 
@@ -129,9 +301,14 @@ export class PlanService {
     const parsed = planStepInputSchema.parse(input);
     const id = parsed.id || assignedId;
     if (!id) throw new Error("Server could not assign a step id");
-    const writes = await Promise.all(parsed.writes.map(async (item) => ({ ...item, repo: item.repo, path: await this.canonicalPath(workspaceId, item.repo, item.path) })));
-    const unique = new Set(writes.map((item) => `${item.repo}:${item.path}`));
-    if (unique.size !== writes.length) throw new Error(`Step ${id} contains duplicate writable paths`);
+    const canonicalWrites = await Promise.all(parsed.writes.map(async (item) => ({ ...item, repo: item.repo, path: await this.canonicalPath(workspaceId, item.repo, item.path) })));
+    const byIdentity = new Map<string, (typeof canonicalWrites)[number]>();
+    for (const write of canonicalWrites) {
+      const key = writeKey(write); const existing = byIdentity.get(key);
+      if (existing) existing.covers = [...new Set([...existing.covers, ...write.covers])];
+      else byIdentity.set(key, write);
+    }
+    const writes = [...byIdentity.values()];
     const context = await Promise.all(parsed.context.map(async (item) => ({ ...item, file: await this.canonicalPath(workspaceId, item.repo, item.file, false) })));
     const seen = new Set<string>();
     const verification: Array<(typeof parsed.verification)[number] & { id: string }> = [];
@@ -180,29 +357,33 @@ export class PlanService {
   async create(workspaceId: string, inputs: PlanStepInput[], exceptions: Array<{ requirement_id: string; reason: string }> = []): Promise<PlanState> {
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
       const memory = await this.active(workspaceId);
+      if (memory.spec_archived_at) throw new Error("SPEC_REQUIRED: Set a new specification before creating a plan");
       const spec = await this.storage.tasks.readStructuredSpec(workspaceId, memory.id);
       if (!spec) throw new Error("SPEC_REQUIRED: Set a structured specification with memory.spec_set before creating a plan");
       if (!inputs.length || inputs.length > 50) throw new Error("A plan requires 1 to 50 steps");
       const previous = await this.storage.read(workspaceId, memory.id);
-      if (previous && !["completed", "abandoned"].includes(previous.status)) throw new Error(`Memory already has a ${previous.status} plan; revise, complete, or abandon it`);
+      if (previous && !previous.archived_at && !["completed", "abandoned"].includes(previous.status)) throw new Error(`Memory already has a ${previous.status} plan; revise, complete, or abandon it`);
       this.assertUniqueSteps(inputs);
       const steps = await Promise.all(inputs.map((step, index) => this.normalizeStep(workspaceId, step, index === 0 ? "current" : "pending", `S${index + 1}`)));
-      await this.assertCoverage(workspaceId, memory.id, steps, exceptions);
+      const repository_baseline = await this.snapshotRepositories(workspaceId, steps);
+      for (const step of steps) if (step.kind === "implementation") step.plan_baseline = await this.snapshotWrites(workspaceId, step);
+      await this.beginStep(workspaceId, steps[0]!);
       const now = new Date().toISOString();
       const plan: PlanState = { schema_version: 1, memory_id: memory.id, spec_hash: structuredSpecHash(spec), spec_revision: spec.revision, revision: 1,
-        status: "active", current_step: 0, steps, revisions: [], lifecycle: [{ status: "active", at: now }], requirement_exceptions: exceptions, marker_exceptions: [], created_at: now, updated_at: now };
+        status: "active", current_step: 0, steps, repository_baseline, revisions: [], lifecycle: [{ status: "active", at: now }], requirement_exceptions: exceptions, marker_exceptions: [], created_at: now, updated_at: now };
       if (previous) await this.storage.archiveTerminal(workspaceId, previous);
       await this.storage.write(workspaceId, plan); return plan;
     });
   }
 
-  async createCompact(workspaceId: string, steps: CompactPlanStep[]): Promise<PlanState> {
-    return this.create(workspaceId, steps.map(expandCompactStep));
+  async createCompact(workspaceId: string, steps: Array<CompactPlanStep | LegacyCompactStep>): Promise<PlanState> {
+    return this.create(workspaceId, await Promise.all(steps.map((step) => this.compactInput(workspaceId, step))));
   }
 
   async state(workspaceId: string): Promise<{ plan?: PlanState; stale: boolean }> {
     const memory = await this.tasks.current(workspaceId); if (!memory) return { stale: false };
-    return this.stateForMemory(workspaceId, memory.id);
+    const state = await this.stateForMemory(workspaceId, memory.id);
+    return state.plan?.archived_at ? { stale: false } : state;
   }
 
   async stateForMemory(workspaceId: string, memoryId: string): Promise<{ plan?: PlanState; stale: boolean }> {
@@ -212,11 +393,42 @@ export class PlanService {
 
   async inspect(workspaceId: string, memoryId: string) {
     const { plan, stale } = await this.stateForMemory(workspaceId, memoryId);
-    if (!plan) return { plan: null, stale: false, review_gate: "no_plan" };
+    if (!plan) return { plan: null, stale: false, review_gate: "no_plan", traceability: [] };
     const receiptCurrent = await this.reviewCurrent(workspaceId, plan);
+    const trustedReceipt = !!(plan.review_receipt && this.tasks.reviewTrust?.verify(plan.review_receipt)
+      && "findings" in plan.review_receipt);
+    const spec = await this.storage.tasks.readStructuredSpec(workspaceId, memoryId);
+    const traceability = (spec?.requirements || []).map((requirement) => {
+      const steps = plan.steps.filter((step) => step.covers.includes(requirement.id)).map((step) => {
+        const coveredWrites = new Set(step.writes.filter((write) => write.covers.includes(requirement.id)).map((write) => `${write.repo}:${write.path}`));
+        const verificationIds = new Set(step.acceptance.filter((item) => item.covers.includes(requirement.id)).flatMap((item) => item.verification_ids));
+        const verifications = step.verification.filter((item) => verificationIds.has(item.id || "")).map((item) => ({
+          id: item.id, command: verificationCommand(item), expected_exit: item.expect_exit, last_exit: item.last_exit,
+          result: item.last_exit === undefined ? "not_run"
+            : item.verified_generation === step.mutation_generation && item.last_exit === item.expect_exit ? "pass" : "fail_or_stale" }));
+        const modifiedPaths = step.modified_paths.map((item) => `${item.repo}:${item.path}`).filter((item) => coveredWrites.has(item));
+        const gaps = [];
+        if (step.kind === "implementation" && !modifiedPaths.length) gaps.push("No changed path linked to this requirement");
+        if (!verifications.length) gaps.push("No verification linked to this requirement");
+        else if (!verifications.some((item) => item.result === "pass")) gaps.push("No passing current verification linked to this requirement");
+        return { step_id: step.id, title: step.title, kind: step.kind, status: step.status,
+          modified_paths: modifiedPaths, verifications, gaps,
+        };
+      });
+      return { requirement_id: requirement.id, statement: requirement.statement, relation: "structural coverage only",
+        steps, gaps: [
+          ...(!steps.length ? ["No plan step covers this requirement"] : []),
+          ...(stale ? ["Plan is bound to an older specification"] : []),
+          ...(!receiptCurrent ? [trustedReceipt ? "Review receipt is blocked or stale" : "Trusted review receipt is missing"] : []),
+        ],
+        review_status: receiptCurrent ? "approved" : trustedReceipt ? "blocked or stale" : "required",
+        review_findings: trustedReceipt && plan.review_receipt && "findings" in plan.review_receipt
+          ? plan.review_receipt.findings.filter((item) => !item.covers?.length || item.covers.includes(requirement.id)) : [],
+      };
+    });
     return { plan, stale, review_gate: stale ? "plan_stale" : plan.status === "completed" ? receiptCurrent ? "satisfied" : "legacy_unverified" : plan.status === "final_review"
       ? receiptCurrent ? "ready" : "code_review_required" : "not_ready", receipt_current: receiptCurrent,
-      unresolved_markers: plan.status === "final_review" ? await this.unresolvedMarkers(workspaceId, plan) : [] };
+      unresolved_markers: plan.status === "final_review" ? await this.unresolvedMarkers(workspaceId, plan) : [], traceability };
   }
 
   async markWriteNotNeeded(workspaceId: string, memoryId: string, repo: string, file: string, reason: string): Promise<PlanState> {
@@ -251,16 +463,22 @@ export class PlanService {
     if (plan.status === "completed" || plan.status === "abandoned") return { active: false as const, completed: plan.status === "completed", abandoned: plan.status === "abandoned", revision: plan.revision };
     if (plan.status === "final_review") return { active: false as const, status: "final_review" as const, stale, spec_revision: plan.spec_revision,
       review_gate: stale ? "PLAN_STALE" : await this.reviewCurrent(workspaceId, plan) ? "ready" : "CODE_REVIEW_REQUIRED",
-      completed_steps: plan.steps.length, total: plan.steps.length,
+      completed_steps: plan.steps.filter((step) => step.status === "completed").length, total: plan.steps.length,
       next_action: stale ? "Ask the operator to resolve the stale plan" : "Invoke code-review-and-quality on the cumulative plan delta; the operator finishes the plan after a clean review" };
     const step = plan.steps[plan.current_step]!;
+    const multipleRepositories = (await this.registry.get(workspaceId)).repositories.length > 1;
+    const checks = await this.configuredChecks(workspaceId, step);
+    const checkRoot = step.writes[0] && (await this.registry.resolveRepository(workspaceId, step.writes[0].repo)).path;
+    const checkHash = checks.length && checkRoot ? await this.repositoryFingerprint(checkRoot) : undefined;
     return { active: (plan.status === "active") as boolean, status: plan.status, guard_status: plan.status === "active" ? await this.guardStatus(workspaceId, integration) : "unavailable", stale,
       stale_reason: stale ? "The memory specification changed after this plan was created; ask the operator to abandon and recreate the plan" : undefined,
       spec_revision: plan.spec_revision, revision: plan.revision, position: plan.current_step + 1, total: plan.steps.length,
       next_action: stale ? "Ask the operator to resolve the stale plan" : plan.status === "active" ? "Work only the current step, then call complete_current" : "Ask the operator to reactivate or abandon the plan",
-      step: { id: step.id, kind: step.kind, title: step.title, objective: step.objective, covers: step.covers, writes: step.writes, context: step.context,
-        acceptance: step.acceptance, verification: step.verification.map((verification) => ({ id: verification.id, command: verificationCommand(verification), expect_exit: verification.expect_exit, current: verification.verified_generation === step.mutation_generation })),
-        mutation_generation: step.mutation_generation, modified_paths: step.modified_paths } };
+      step: { id: step.id, title: step.title, objective: step.objective, writes: step.acceptance.length ? step.writes : step.writes.map((write) => multipleRepositories ? writeKey(write) : write.path),
+        required_checks: checks.map((check) => ({ ...check, current: !!step.check_receipts?.some((receipt) =>
+          receipt.id === check.id && receipt.content_hash === checkHash && receipt.exit_code === 0) })), modified_paths: step.modified_paths,
+        ...(step.acceptance.length ? { acceptance: step.acceptance,
+          verification: step.verification.map((verification) => ({ id: verification.id, command: verificationCommand(verification), current: verification.verified_generation === step.mutation_generation })) } : {}) } };
   }
 
   async context(workspaceId: string): Promise<string> {
@@ -268,7 +486,7 @@ export class PlanService {
     if (!("step" in current) || !current.step) return "## ACTIVE PLAN\n\nNone.";
     return ["## ACTIVE PLAN", `Status: ${current.stale ? "STALE" : "active"}; revision ${current.revision}`,
       `Current: ${current.position}/${current.total} — ${current.step.id} ${current.step.title}`,
-      `Goal: ${current.step.objective}`, `Write: ${current.step.writes.map((item) => `${item.repo}:${item.path}`).join(", ")}`].join("\n\n");
+      `Goal: ${current.step.objective}`, `Write: ${current.step.writes.map((item) => typeof item === "string" ? item : `${item.repo}:${item.path}`).join(", ")}`].join("\n\n");
   }
 
   async complete(workspaceId: string, allowFinalReview = true) {
@@ -278,9 +496,6 @@ export class PlanService {
       if (plan.status === "final_review") {
         if (!allowFinalReview) throw new Error("CODE_REVIEW_REQUIRED: Final plan completion belongs to the operator after the cumulative review gate");
         const gaps: string[] = []; const covered = new Set(plan.steps.flatMap((item) => item.covers));
-        const spec = await this.storage.tasks.readStructuredSpec(workspaceId, plan.memory_id);
-        for (const requirement of spec?.requirements || []) if (requirement.priority === "must" && !covered.has(requirement.id)
-          && !plan.requirement_exceptions.some((item) => item.requirement_id === requirement.id)) gaps.push(`${requirement.id} has no final evidence`);
         gaps.push(...(await this.unresolvedMarkers(workspaceId, plan)).map((item) => `${item} contains an unresolved implementation marker`));
         if (!(await this.reviewCurrent(workspaceId, plan))) {
           gaps.push("CODE_REVIEW_REQUIRED: a fresh, clean code-review-and-quality receipt is required for the cumulative plan code state");
@@ -293,23 +508,40 @@ export class PlanService {
       }
       const step = plan.steps[plan.current_step]!; const missing: string[] = [];
       if (step.status !== "current") missing.push("current step is not active");
+      if (step.pending_shell || step.pending_mutation) missing.push("tool effects have not been verified by the guard");
       for (const violation of step.violations) missing.push(`guard violation at ${violation.repo}:${violation.path}: ${violation.reason}`);
-      if (step.kind === "implementation" && step.mutation_generation === 0) missing.push("implementation step has no observed content mutation");
+      let contentDeltaVerified = false;
       if (step.kind === "implementation") {
-        const changed = new Set(step.modified_paths.map((item) => `${item.repo}:${item.path}`));
-        for (const write of step.writes) if (!write.not_needed_reason && !changed.has(`${write.repo}:${write.path}`)) missing.push(`${write.repo}:${write.path} has no observed content delta`);
+        const { current, changed } = await this.reconcileWrites(workspaceId, plan, step);
+        const changedKeys = new Set(changed.map(writeKey));
+        const planBaseline = new Map(step.plan_baseline?.map((item) => [writeKey(item), item.state]) || []);
+        for (const item of current) {
+          const before = planBaseline.get(writeKey(item));
+          if (before && item.state.kind === "file" && !sameState(before, item.state)) changedKeys.add(writeKey(item));
+        }
+        contentDeltaVerified = changedKeys.size > 0;
+        for (const write of step.writes) if (!write.not_needed_reason && !changedKeys.has(writeKey(write))) {
+          const state = current.find((item) => writeKey(item) === writeKey(write))!.state;
+          missing.push(`${writeKey(write)} ${state.kind === "other" ? "is not a regular readable file" : "is unchanged from the server-owned baseline (no filesystem content delta)"}`);
+        }
+        for (const verification of step.verification) if (verification.write_states &&
+          (verification.write_states.length !== current.length || verification.write_states.some((item, index) =>
+            writeKey(item) !== writeKey(current[index]!) || !sameState(item.state, current[index]!.state)))) {
+          missing.push(`${verificationCommand(verification)} predates the current declared write content`);
+        }
       }
+      if (!missing.length) missing.push(...await this.runConfiguredChecks(workspaceId, step, plan));
       for (const verification of step.verification) {
         if (verification.verified_generation !== step.mutation_generation || verification.last_exit !== verification.expect_exit) {
           missing.push(`${verificationCommand(verification)} has not passed for mutation generation ${step.mutation_generation}`);
         }
       }
-      if (missing.length) return { advanced: false, message: "STEP NOT COMPLETE", missing };
+      if (missing.length) { await this.storage.write(workspaceId, plan); return { advanced: false, message: "STEP_NOT_COMPLETE", missing, content_delta_verified: contentDeltaVerified }; }
       step.status = "completed"; const completed = plan.current_step;
-      if (completed + 1 < plan.steps.length) { plan.current_step += 1; plan.steps[plan.current_step]!.status = "current"; }
+      if (completed + 1 < plan.steps.length) { plan.current_step += 1; plan.steps[plan.current_step]!.status = "current"; await this.beginStep(workspaceId, plan.steps[plan.current_step]!); }
       else { plan.status = "final_review"; plan.lifecycle.push({ status: "final_review", at: new Date().toISOString() }); }
       plan.updated_at = new Date().toISOString(); await this.storage.write(workspaceId, plan);
-      return { advanced: true, completed_step: step.id, plan_completed: false, final_review: plan.status === "final_review",
+      return { advanced: true, completed_step: step.id, plan_completed: false, final_review: plan.status === "final_review", content_delta_verified: contentDeltaVerified,
         current_step: plan.status === "active" ? plan.steps[plan.current_step]!.id : undefined };
     });
   }
@@ -318,20 +550,38 @@ export class PlanService {
     return this.complete(workspaceId, false);
   }
 
-  async reviseCurrentCompact(workspaceId: string, reason: string, input: CompactPlanStep): Promise<PlanState> {
+  async reviseCurrentCompact(workspaceId: string, reason: string, input: CompactPlanStep | LegacyCompactStep): Promise<PlanState> {
     if (!reason.trim() || reason.trim().length > 2_000) throw new Error("Plan revision requires a bounded reason");
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
-      const memory = await this.active(workspaceId);
+      await this.active(workspaceId);
       const { plan, stale } = await this.state(workspaceId);
       if (!plan || plan.status !== "active") throw new Error("No active plan");
       if (stale) throw new Error("PLAN_STALE: The memory specification changed; ask the operator to resolve the plan");
       const old = plan.steps[plan.current_step]!;
-      const revised = await this.normalizeStep(workspaceId, expandCompactStep(input), "current", old.id);
+      const revised = await this.normalizeStep(workspaceId, await this.compactInput(workspaceId, input), "current", old.id);
       const allowed = new Set(revised.writes.map((write) => `${write.repo}:${write.path}`));
-      if (old.modified_paths.some((item) => !allowed.has(`${item.repo}:${item.path}`))) throw new Error("Revised current step cannot discard paths already modified");
-      revised.modified_paths = old.modified_paths; revised.mutation_generation = old.mutation_generation; revised.violations = old.violations;
+      const snapshot = revised.kind === "implementation" ? await this.snapshotWrites(workspaceId, revised) : [];
+      const migrated = old.modified_paths.map((item) => {
+        if (allowed.has(writeKey(item))) return item;
+        const corrected = revised.writes.find((write) => write.repo === item.repo && item.path === `${write.repo}/${write.path}`);
+        const initial = corrected && this.creationBaseline(plan, corrected);
+        const current = corrected && snapshot.find((entry) => writeKey(entry) === writeKey(corrected));
+        if (corrected && initial && current?.state.kind === "file" && !sameState(initial.state, current.state))
+          return { repo: corrected.repo, path: corrected.path };
+        throw new Error("Revised current step cannot discard paths already modified");
+      });
+      revised.modified_paths = [...new Map(migrated.map((item) => [writeKey(item), item])).values()];
+      revised.mutation_generation = old.mutation_generation; revised.violations = old.violations;
+      revised.write_baseline = old.write_baseline;
+      revised.plan_baseline = old.plan_baseline;
+      if (!revised.write_baseline || revised.writes.some((write) => !revised.write_baseline!.some((item) => writeKey(item) === writeKey(write)))) {
+        revised.write_baseline = revised.writes.map((write) => old.write_baseline?.find((item) => writeKey(item) === writeKey(write)) || snapshot.find((item) => writeKey(item) === writeKey(write))!);
+      }
+      if (revised.kind === "implementation") {
+        revised.plan_baseline = revised.writes.map((write) => old.plan_baseline?.find((item) => writeKey(item) === writeKey(write))
+          || this.creationBaseline(plan, write) || snapshot.find((item) => writeKey(item) === writeKey(write))!);
+      }
       const steps = [...plan.steps]; steps[plan.current_step] = revised;
-      await this.assertCoverage(workspaceId, memory.id, steps, plan.requirement_exceptions);
       plan.steps = steps; plan.revision += 1; plan.updated_at = new Date().toISOString();
       plan.revisions.push({ revision: plan.revision, reason: reason.trim(), at: plan.updated_at, previous_step: old });
       plan.revisions = plan.revisions.slice(-20);
@@ -344,7 +594,7 @@ export class PlanService {
   }
 
   private async reviewCurrent(workspaceId: string, plan: PlanState): Promise<boolean> {
-    return reviewReceiptCurrent(workspaceId, plan, this.registry);
+    return reviewReceiptCurrent(workspaceId, plan, this.registry, this.tasks.reviewTrust);
   }
 
   private async unresolvedMarkers(workspaceId: string, plan: PlanState): Promise<string[]> {
@@ -369,9 +619,9 @@ export class PlanService {
       if (currentInput.id !== current.id) throw new Error(`Revision cannot skip the server-owned current step ${current.id}`);
       this.assertUniqueSteps([currentInput, ...futureInputs]);
       const revisedCurrent = await this.normalizeStep(workspaceId, currentInput, "current", current.id);
+      await this.beginStep(workspaceId, revisedCurrent);
       const future = await Promise.all(futureInputs.map((step, index) => this.normalizeStep(workspaceId, step, "pending", `S${existing.current_step + index + 2}`)));
       existing.steps = [...existing.steps.slice(0, existing.current_step), revisedCurrent, ...future];
-      await this.assertCoverage(workspaceId, memory.id, existing.steps, existing.requirement_exceptions);
       existing.revision += 1; existing.updated_at = new Date().toISOString();
       existing.revisions = [...existing.revisions, { revision: existing.revision, reason: reason.trim(), at: existing.updated_at }].slice(-20);
       await this.storage.write(workspaceId, existing); return existing;
@@ -390,8 +640,12 @@ export class PlanService {
       const plan = await this.storage.read(workspaceId, memory.id); if (!plan || plan.status !== "active") throw new Error("No active plan");
       if ((await this.stateForMemory(workspaceId, memory.id)).stale) throw new Error("PLAN_STALE: The memory specification changed; abandon and recreate this plan");
       for (const operation of operations) {
-        if (operation.op === "replace_current") plan.steps[plan.current_step] = await this.normalizeStep(workspaceId,
-          { ...operation.step, id: plan.steps[plan.current_step]!.id }, "current", plan.steps[plan.current_step]!.id);
+        if (operation.op === "replace_current") {
+          const replacement = await this.normalizeStep(workspaceId,
+            { ...operation.step, id: plan.steps[plan.current_step]!.id }, "current", plan.steps[plan.current_step]!.id);
+          await this.beginStep(workspaceId, replacement);
+          plan.steps[plan.current_step] = replacement;
+        }
         else if (operation.op === "drop_future") plan.steps = plan.steps.slice(0, plan.current_step + 1);
         else if (operation.op === "append_steps") {
           let next = Math.max(...plan.steps.map((item) => Number(item.id.slice(1)) || 0)) + 1;
@@ -408,7 +662,6 @@ export class PlanService {
             { repo: operation.repo, path: canonical, marker: operation.marker, reason: operation.reason.trim() }];
         }
       }
-      await this.assertCoverage(workspaceId, memory.id, plan.steps, plan.requirement_exceptions);
       plan.revision += 1; plan.updated_at = new Date().toISOString();
       plan.revisions = [...plan.revisions, { revision: plan.revision, reason: reason.trim(), at: plan.updated_at }].slice(-20);
       await this.storage.write(workspaceId, plan); return plan;
@@ -452,41 +705,74 @@ export class PlanService {
   async recordVerification(workspaceId: string, command: string, exitCode: number): Promise<boolean> {
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
       const { plan, stale } = await this.state(workspaceId); if (!plan || plan.status !== "active" || stale) return false;
-      const step = plan.steps[plan.current_step]!; const verification = step.verification.find((item) => verificationCommand(item) === command);
-      if (!verification) return false;
+      const step = plan.steps[plan.current_step]!;
+      if (!step.verification.some((item) => verificationCommand(item) === command)) return false;
+      const current = step.kind === "implementation" ? (await this.reconcileWrites(workspaceId, plan, step)).current : [];
+      const verification = step.verification.find((item) => verificationCommand(item) === command)!;
       verification.last_exit = exitCode;
-      if (exitCode === verification.expect_exit) verification.verified_generation = step.mutation_generation;
-      else delete verification.verified_generation;
+      if (exitCode === verification.expect_exit) { verification.verified_generation = step.mutation_generation; verification.write_states = current; }
+      else { delete verification.verified_generation; delete verification.write_states; }
       plan.updated_at = new Date().toISOString(); await this.storage.write(workspaceId, plan); return true;
     });
   }
 
-  async captureShell(workspaceId: string): Promise<void> {
-    await this.storage.tasks.workspaceLock(workspaceId, async () => {
+  async captureShell(workspaceId: string): Promise<ShellWork> {
+    return this.storage.tasks.workspaceLock(workspaceId, async () => {
       const { plan, stale } = await this.state(workspaceId); if (!plan || plan.status !== "active" || stale) throw new Error("No valid active plan");
-      const files: Array<{ repo: string; path: string; hash: string }> = [];
+      const work: ShellWork = { scans: 0, stats: 0, hashes: 0, snapshot_bytes: 0 };
+      const files = await shellMetadata(this.registry, workspaceId, work);
+      const allowedHashes: Array<[string, string | null]> = [];
       const workspace = await this.registry.get(workspaceId);
-      for (const repository of workspace.repositories) for (const relative of await walkReadableFiles(repository.path)) {
-        const hash = await contentHash(path.join(repository.path, relative)); if (hash) files.push({ repo: repository.id, path: relative, hash });
+      for (const write of plan.steps[plan.current_step]!.writes) {
+        const repository = workspace.repositories.find((item) => item.id === write.repo)!;
+        const key = `${write.repo}:${write.path}`;
+        const hash = await contentHash(path.join(repository.path, write.path)); work.hashes++;
+        allowedHashes.push([key, hash || null]);
       }
-      plan.steps[plan.current_step]!.pending_shell = { files };
+      const snapshot = gzipSync(JSON.stringify([...files]), { level: 6 }).toString("base64");
+      work.snapshot_bytes = Buffer.byteLength(snapshot) + Buffer.byteLength(JSON.stringify(allowedHashes));
+      plan.steps[plan.current_step]!.pending_shell = { snapshot, allowed_hashes: allowedHashes, snapshot_bytes: work.snapshot_bytes };
       plan.updated_at = new Date().toISOString(); await this.storage.write(workspaceId, plan);
+      return work;
     });
   }
 
-  async recordShell(workspaceId: string, command: string, exitCode: number): Promise<{ verified: boolean; changed: string[]; violations: string[] }> {
+  async recordShell(workspaceId: string, command: string, exitCode: number): Promise<{ verified: boolean; changed: string[]; violations: string[]; work?: ShellWork }> {
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
       const { plan, stale } = await this.state(workspaceId); if (!plan || plan.status !== "active" || stale) return { verified: false, changed: [], violations: [] };
-      const step = plan.steps[plan.current_step]!; const before = new Map((step.pending_shell?.files || []).map((item) => [`${item.repo}:${item.path}`, item.hash]));
-      delete step.pending_shell; const after = new Map<string, string>(); const workspace = await this.registry.get(workspaceId);
-      for (const repository of workspace.repositories) for (const relative of await walkReadableFiles(repository.path)) {
-        const hash = await contentHash(path.join(repository.path, relative)); if (hash) after.set(`${repository.id}:${relative}`, hash);
+      const step = plan.steps[plan.current_step]!;
+      const pending = step.pending_shell;
+      if (!pending) throw new Error("Shell snapshot is missing; command effects cannot be verified");
+      const work: ShellWork = { scans: 0, stats: 0, hashes: 0, snapshot_bytes: "snapshot_bytes" in pending ? pending.snapshot_bytes : Buffer.byteLength(JSON.stringify(pending)) };
+      const before = "snapshot" in pending
+        ? new Map<string, string>(JSON.parse(gunzipSync(Buffer.from(pending.snapshot, "base64")).toString("utf8")) as Array<[string, string]>)
+        : new Map(pending.files.map((item) => [`${item.repo}:${item.path}`, item.hash]));
+      let after = await shellMetadata(this.registry, workspaceId, work);
+      if ("files" in pending) {
+        const hashes = new Map<string, string>();
+        const workspace = await this.registry.get(workspaceId);
+        for (const key of after.keys()) {
+          const [repo, ...parts] = key.split(":"); const repository = workspace.repositories.find((item) => item.id === repo)!;
+          const hash = await contentHash(path.join(repository.path, parts.join(":"))); work.hashes++;
+          if (hash) hashes.set(key, hash);
+        }
+        after = hashes;
       }
-      const changed = [...new Set([...before.keys(), ...after.keys()])].filter((key) => before.get(key) !== after.get(key));
-      const allowed = new Set(step.writes.map((item) => `${item.repo}:${item.path}`)); const violations = changed.filter((item) => !allowed.has(item));
+      const candidates = [...new Set([...before.keys(), ...after.keys()])].filter((key) => before.get(key) !== after.get(key));
+      const allowed = new Set(step.writes.map((item) => `${item.repo}:${item.path}`));
+      const violations = candidates.filter((item) => !allowed.has(item));
+      const workspace = await this.registry.get(workspaceId);
+      const allowedBefore = "allowed_hashes" in pending ? new Map(pending.allowed_hashes) : before;
+      const authorized: string[] = [];
+      for (const item of candidates.filter((key) => allowed.has(key))) {
+        const [repo, ...parts] = item.split(":"); const repository = workspace.repositories.find((value) => value.id === repo)!;
+        const hash = await contentHash(path.join(repository.path, parts.join(":"))); work.hashes++;
+        if ((allowedBefore.get(item) || undefined) !== hash) authorized.push(item);
+      }
+      const changed = [...violations, ...authorized];
+      delete step.pending_shell;
       const now = new Date().toISOString();
       for (const item of violations) { const [repo, ...parts] = item.split(":"); step.violations.push({ repo: repo!, path: parts.join(":"), reason: "shell changed a path outside the current write-set", at: now }); }
-      const authorized = changed.filter((item) => allowed.has(item));
       if (authorized.length) {
         step.mutation_generation += 1;
         for (const item of authorized) { const [repo, ...parts] = item.split(":"); const target = { repo: repo!, path: parts.join(":") };
@@ -497,10 +783,15 @@ export class PlanService {
       }
       let verified = false;
       if (changed.length === 0) {
-        const verification = step.verification.find((item) => verificationCommand(item) === command.trim());
-        if (verification) { verification.last_exit = exitCode; if (exitCode === verification.expect_exit) { verification.verified_generation = step.mutation_generation; verified = true; } else delete verification.verified_generation; }
+        if (step.verification.some((item) => verificationCommand(item) === command.trim())) {
+          const current = step.kind === "implementation" ? (await this.reconcileWrites(workspaceId, plan, step)).current : [];
+          const verification = step.verification.find((item) => verificationCommand(item) === command.trim())!;
+          verification.last_exit = exitCode;
+          if (exitCode === verification.expect_exit) { verification.verified_generation = step.mutation_generation; verification.write_states = current; verified = true; }
+          else { delete verification.verified_generation; delete verification.write_states; }
+        }
       }
-      plan.updated_at = now; await this.storage.write(workspaceId, plan); return { verified, changed, violations };
+      plan.updated_at = now; await this.storage.write(workspaceId, plan); return { verified, changed, violations, work };
     });
   }
 
@@ -509,19 +800,27 @@ export class PlanService {
     return this.transitionForMemory(workspaceId, memory.id, status, reason);
   }
 
-  async transitionForMemory(workspaceId: string, memoryId: string, status: "suspended" | "active" | "abandoned", reason?: string): Promise<PlanState> {
+  async transitionForMemory(workspaceId: string, memoryId: string, status: "suspended" | "active" | "final_review" | "abandoned", reason?: string): Promise<PlanState> {
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
       const plan = await this.storage.read(workspaceId, memoryId);
       if (!plan || ["completed", "abandoned"].includes(plan.status)) throw new Error("No non-terminal plan");
-      if (status === "active" && plan.status !== "suspended") throw new Error("Only a suspended plan can be reactivated");
-      if (status === "suspended" && plan.status !== "active") throw new Error("Only an active plan can be suspended");
+      if (status === "active" && (plan.status !== "suspended" || plan.suspended_from_final_review)) throw new Error("Only a suspended execution plan can be activated; resume final review separately");
+      if (status === "suspended" && plan.status !== "active" && plan.status !== "final_review") throw new Error("Only an active or final-review plan can be suspended");
+      if (status === "final_review" && (plan.status !== "suspended" || !plan.suspended_from_final_review)) throw new Error("Final review can only resume after it was suspended, or after the last step passes its checks");
       if (status === "abandoned" && !reason?.trim()) throw new Error("Abandoning a plan requires a reason");
-      if (status === "active") {
+      if (status === "active" || status === "final_review") {
         if (plan.archived_at) throw new Error("Restore this archived plan before reactivating it");
         const selected = await this.tasks.current(workspaceId);
-        if (selected?.id !== memoryId) throw new Error("Select this memory as active before reactivating its plan");
+        if (selected?.id !== memoryId) throw new Error("Select this memory as active before resuming its plan");
         if ((await this.stateForMemory(workspaceId, memoryId)).stale) throw new Error("PLAN_STALE: Abandon and recreate this plan against the current spec");
+        if (status === "active" && plan.imported_from && !plan.repository_baseline) {
+          plan.repository_baseline = await this.snapshotRepositories(workspaceId, plan.steps);
+          for (const step of plan.steps) if (step.kind === "implementation") step.plan_baseline = await this.snapshotWrites(workspaceId, step);
+          await this.beginStep(workspaceId, plan.steps[0]!);
+        }
       }
+      if (status === "suspended" && plan.status === "final_review") plan.suspended_from_final_review = true;
+      else if (status !== "suspended") delete plan.suspended_from_final_review;
       plan.status = status; plan.updated_at = new Date().toISOString();
       plan.lifecycle = [...plan.lifecycle, { status, reason: reason?.trim(), at: plan.updated_at }].slice(-50);
       await this.storage.write(workspaceId, plan); return plan;
@@ -532,8 +831,24 @@ export class PlanService {
     return this.storage.tasks.workspaceLock(workspaceId, async () => {
       const plan = await this.storage.read(workspaceId, memoryId);
       if (!plan) throw new Error("No plan for this memory");
-      if (archived && ["active", "final_review"].includes(plan.status)) throw new Error("Suspend or abandon the active plan before archiving it");
-      if (archived) plan.archived_at = new Date().toISOString(); else delete plan.archived_at;
+      if (!!plan.archived_at === archived) return plan;
+      const now = new Date().toISOString();
+      if (archived) {
+        if (plan.status === "final_review") plan.archived_previous_status = "final_review";
+        if (plan.status === "active" || plan.status === "final_review") {
+          plan.status = "suspended";
+          plan.lifecycle = [...plan.lifecycle, { status: "suspended", reason: "Archived by operator", at: now }].slice(-50);
+        }
+        plan.archived_at = now;
+      } else {
+        delete plan.archived_at;
+        if (plan.archived_previous_status === "final_review") {
+          plan.status = "final_review";
+          plan.lifecycle = [...plan.lifecycle, { status: "final_review", reason: "Restored by operator", at: now }].slice(-50);
+        }
+        delete plan.archived_previous_status;
+      }
+      plan.updated_at = now;
       await this.storage.write(workspaceId, plan);
       return plan;
     });

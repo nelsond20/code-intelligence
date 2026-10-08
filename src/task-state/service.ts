@@ -5,15 +5,25 @@ import { renderTaskContext, taskBootstrap } from "./context-renderer.js";
 import { slugify } from "../workspace/paths.js";
 import { planStateSchema } from "../plan/schemas.js";
 import { planBindingStale } from "../plan/binding.js";
-import { reviewReceiptCurrent } from "../plan/review-state.js";
+import { reviewReceiptCurrent, type ReviewReceiptTrust } from "../plan/review-state.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
+import { projectTaskState } from "./projection.js";
 
 function uniquePush(values: string[], value: string, max = 50): string[] {
   return [value, ...values.filter((item) => item !== value)].slice(0, max);
 }
 
 export class TaskService {
-  constructor(readonly storage = new TaskStorage()) {}
+  constructor(readonly storage = new TaskStorage(), readonly reviewTrust?: ReviewReceiptTrust) {}
+
+  private async writeCurrentSpec(workspaceId: string, target: TaskState, spec: StructuredSpec): Promise<void> {
+    await this.storage.writeStructuredSpec(workspaceId, target.id, { ...spec, archived_at: undefined });
+    if (target.spec_archived_at) {
+      delete target.spec_archived_at;
+      target.updated_at = spec.created_at;
+      await this.storage.write(workspaceId, target);
+    }
+  }
 
   async list(workspaceId: string): Promise<TaskState[]> { return this.storage.list(workspaceId); }
   async current(workspaceId: string): Promise<TaskState | undefined> {
@@ -42,7 +52,7 @@ export class TaskService {
       const state: TaskState = {
         schema_version: 2, id, title: title.trim(), status: options.activate === false ? "paused" : "active",
         phase: options.phase || "investigation", objective: options.objective || "",
-        confirmed_findings: [], active_hypotheses: [], rejected_hypotheses: [], open_questions: [], blockers: [],
+        confirmed_findings: [], supported_findings: [], active_hypotheses: [], rejected_hypotheses: [], open_questions: [], blockers: [],
         relevant_files: [], relevant_symbols: [], inspected_refs: [], inspected_files: [], inspected_symbols: [], inspected_commits: [], records: [], created_at: now, updated_at: now,
       };
       await this.storage.initialize(workspaceId, state);
@@ -94,7 +104,8 @@ export class TaskService {
       const evidence = plan?.final_evidence;
       const outcomeSummary = summary?.trim() || `Covered ${(evidence?.covered_requirements || []).join(", ")}; changed ${(evidence?.modified_paths || []).join(", ")}; verified ${(evidence?.verifications || []).join(", ")}.`;
       const now = new Date().toISOString(); const state: TaskState = { ...target, status: "completed", outcome: {
-        summary: outcomeSummary, limitations, evidence_refs: [...(evidence?.modified_paths || []), ...(evidence?.verifications || [])], completed_at: now }, updated_at: now };
+        summary: outcomeSummary, limitations, evidence_refs: [], modified_paths: evidence?.modified_paths || [],
+        verifications: evidence?.verifications || [], provenance_version: 2, completed_at: now }, updated_at: now };
       await this.storage.write(workspaceId, state); return state;
     });
   }
@@ -110,6 +121,7 @@ export class TaskService {
       const previous = spec === undefined ? undefined : await this.storage.readStructuredSpec(workspaceId, target.id);
       const structured = spec === undefined ? undefined : structuredSpecSchema.parse({ revision: (previous?.revision || 0) + 1, summary: spec,
         requirements: [{ id: "R1", statement: spec, kind: "behavior", priority: "must" }], reason: "legacy update compatibility", created_at: new Date().toISOString() });
+      if (structured) delete state.spec_archived_at;
       await this.storage.transaction(workspaceId, state.id, "update-memory", async () => {
         await this.storage.write(workspaceId, state);
         if (structured) await this.storage.writeStructuredSpec(workspaceId, state.id, structured);
@@ -124,7 +136,10 @@ export class TaskService {
       const current = await this.current(workspaceId);
       if (!current) throw new Error("NO_ACTIVE_MEMORY: Memory selection is controlled by the operator in the local control plane.");
       const state: TaskState = structuredClone(current);
-      for (const ref of note.evidence_refs) if (!state.inspected_refs.includes(ref)) throw new Error(`Evidence ref has not been inspected in this memory: ${ref}`);
+      for (const ref of note.evidence_refs) {
+        if (state.records.some((item) => item.id === ref)) throw new Error(`INVALID_EVIDENCE_REF_KIND: ${ref} is a memory record ID, not a context evidence reference. Do not place memory record IDs in evidence_refs; obtain evidence through context.find and context.inspect.`);
+        if (!state.inspected_refs.includes(ref)) throw new Error(`Evidence ref has not been inspected in this memory: ${ref}`);
+      }
       const now = new Date().toISOString();
       const recordKind = note.type === "hypothesis_rejected" ? "hypothesis" : note.type;
       if (note.type === "hypothesis_rejected") throw new Error("Reject hypotheses with memory.resolve and the server-owned record id");
@@ -136,12 +151,6 @@ export class TaskService {
       state.next_record_id = nextRecordId + 1;
       const detail = [note.repo && `repo=${note.repo}`, note.file && `file=${note.file}`, note.symbol && `symbol=${note.symbol}`].filter(Boolean).join(", ");
       const heading = note.type.replaceAll("_", " ").replace(/^./, (v) => v.toUpperCase());
-      if ((note.type === "observation" || note.type === "evidence" || note.type === "decision") && note.evidence_refs.length) state.confirmed_findings = uniquePush(state.confirmed_findings, note.text);
-      if (note.type === "hypothesis") {
-        state.active_hypotheses = [{ id: `hyp-${Date.now().toString(36)}`, text: note.text, confidence: note.confidence }, ...state.active_hypotheses.filter((h) => h.text !== note.text)].slice(0, 30);
-      }
-      if (note.type === "question") state.open_questions = uniquePush(state.open_questions, note.text);
-      if (note.type === "blocker") state.blockers = uniquePush(state.blockers, note.text);
       if (note.repo && note.file) state.relevant_files = [{ repo: note.repo, path: note.file }, ...state.relevant_files.filter((v) => v.repo !== note.repo || v.path !== note.file)];
       if (note.symbol) state.relevant_symbols = uniquePush(state.relevant_symbols, note.symbol);
       state.updated_at = now;
@@ -149,7 +158,7 @@ export class TaskService {
         await this.storage.appendFinding(workspaceId, state.id, `## ${heading} — ${now}\n\n${note.text}${detail ? `\n\nContext: ${detail}` : ""}`);
         await this.storage.write(workspaceId, state);
       });
-      return state;
+      return projectTaskState(state);
     });
   }
 
@@ -189,7 +198,7 @@ export class TaskService {
       const now = new Date().toISOString();
       const spec = structuredSpecSchema.parse({ revision: (previous?.revision || 0) + 1, summary: input.summary,
         requirements: input.requirements.map((item, index) => ({ ...item, id: `R${index + 1}` })), reason, created_at: now });
-      await this.storage.transaction(workspaceId, target.id, "replace-specification", () => this.storage.writeStructuredSpec(workspaceId, target.id, spec),
+      await this.storage.transaction(workspaceId, target.id, "replace-specification", () => this.writeCurrentSpec(workspaceId, target, spec),
         [`spec_revision_${spec.revision}`]);
       return spec;
     });
@@ -201,7 +210,7 @@ export class TaskService {
       const target = await this.current(workspaceId);
       if (!target) throw new Error("NO_ACTIVE_MEMORY: Memory selection is controlled by the operator in the local control plane.");
       const previous = await this.storage.readStructuredSpec(workspaceId, target.id);
-      const existing = new Map(previous?.requirements.map((item) => [item.id, item]) || []);
+      const existing = new Map((target.spec_archived_at ? undefined : previous)?.requirements.map((item) => [item.id, item]) || []);
       const seen = new Set<string>();
       let next = 1;
       if (previous) for (let revision = 1; revision <= previous.revision; revision++) {
@@ -222,13 +231,16 @@ export class TaskService {
         return old && (old.statement !== item.statement || old.kind !== item.kind || old.priority !== item.priority);
       }).map((item) => item.id);
       const removed = [...existing.keys()].filter((id) => !seen.has(id));
-      const changed = !previous || previous.summary !== desired.summary || added.length > 0 || updated.length > 0 || removed.length > 0
+      const changed = !previous || !!target.spec_archived_at || previous.summary !== desired.summary || added.length > 0 || updated.length > 0 || removed.length > 0
         || JSON.stringify(previous.requirements.map((item) => item.id)) !== JSON.stringify(requirements.map((item) => item.id));
       const diff = { added, updated, removed };
       if (!changed && previous) return { spec: previous, revision: previous.revision, diff, changed: false };
       const spec = structuredSpecSchema.parse({ revision: (previous?.revision || 0) + 1, summary: desired.summary, requirements,
         reason: "Declarative specification update", created_at: new Date().toISOString() });
-      await this.storage.transaction(workspaceId, target.id, "set-specification", () => this.storage.writeStructuredSpec(workspaceId, target.id, spec),
+      await this.storage.transaction(workspaceId, target.id, "set-specification", async () => {
+        await this.storage.writeStructuredSpec(workspaceId, target.id, spec);
+        if (target.spec_archived_at) { delete target.spec_archived_at; target.updated_at = spec.created_at; await this.storage.write(workspaceId, target); }
+      },
         [`spec_revision_${spec.revision}`]);
       return { spec, revision: spec.revision, diff, changed: true };
     });
@@ -250,8 +262,8 @@ export class TaskService {
           if (operation.op === "remove") requirements.splice(index, 1); else requirements[index] = { ...requirements[index]!, ...operation.requirement };
         }
       }
-      const spec = structuredSpecSchema.parse({ ...previous, revision: previous.revision + 1, requirements, reason, created_at: new Date().toISOString() });
-      await this.storage.transaction(workspaceId, target.id, "patch-specification", () => this.storage.writeStructuredSpec(workspaceId, target.id, spec),
+      const spec = structuredSpecSchema.parse({ ...previous, revision: previous.revision + 1, requirements, reason, created_at: new Date().toISOString(), archived_at: undefined });
+      await this.storage.transaction(workspaceId, target.id, "patch-specification", () => this.writeCurrentSpec(workspaceId, target, spec),
         [`spec_revision_${spec.revision}`]);
       return spec;
     });
@@ -264,9 +276,9 @@ export class TaskService {
       const current = await this.storage.readStructuredSpec(workspaceId, target.id); if (!current) throw new Error("No structured specification to roll back");
       const selected = await this.storage.readSpecRevision(workspaceId, target.id, revision);
       const restored = structuredSpecSchema.parse({ ...selected, revision: current.revision + 1,
-        reason: `Rollback to revision ${revision}: ${reason.trim()}`, created_at: new Date().toISOString() });
+        reason: `Rollback to revision ${revision}: ${reason.trim()}`, created_at: new Date().toISOString(), archived_at: undefined });
       await this.storage.transaction(workspaceId, target.id, "rollback-specification",
-        () => this.storage.writeStructuredSpec(workspaceId, target.id, restored), [`spec_revision_${restored.revision}`]);
+        () => this.writeCurrentSpec(workspaceId, target, restored), [`spec_revision_${restored.revision}`]);
       return restored;
     });
   }
@@ -277,17 +289,13 @@ export class TaskService {
       const state = await this.current(workspaceId); if (!state) throw new Error("NO_ACTIVE_MEMORY: Memory selection is controlled by the operator in the local control plane.");
       const record = state.records.find((item) => item.id === recordId); if (!record) throw new Error(`Unknown memory record: ${recordId}`);
       const refs = [...new Set([...record.evidence_refs, ...evidenceRefs])];
-      for (const ref of refs) if (!state.inspected_refs.includes(ref)) throw new Error(`Evidence ref has not been inspected in this memory: ${ref}`);
+      for (const ref of refs) {
+        if (state.records.some((item) => item.id === ref)) throw new Error(`INVALID_EVIDENCE_REF_KIND: ${ref} is a memory record ID, not a context evidence reference. Do not place memory record IDs in evidence_refs; obtain evidence through context.find and context.inspect.`);
+        if (!state.inspected_refs.includes(ref)) throw new Error(`Evidence ref has not been inspected in this memory: ${ref}`);
+      }
       if (resolvedStatus === "confirmed" && refs.length === 0) throw new Error("Confirming a technical record requires inspected evidence");
       record.status = resolvedStatus; record.reason = reason.trim(); record.evidence_refs = refs; record.updated_at = new Date().toISOString();
-      if (resolvedStatus === "confirmed") state.confirmed_findings = uniquePush(state.confirmed_findings, record.text);
-      if (record.kind === "hypothesis" && ["rejected", "superseded", "ruled_out"].includes(resolvedStatus)) {
-        state.active_hypotheses = state.active_hypotheses.filter((item) => item.text !== record.text);
-        state.rejected_hypotheses.unshift({ id: record.id, text: record.text, confidence: record.confidence, reason: record.reason });
-      }
-      if (record.kind === "question" && resolvedStatus === "resolved") state.open_questions = state.open_questions.filter((item) => item !== record.text);
-      if (record.kind === "blocker" && resolvedStatus === "resolved") state.blockers = state.blockers.filter((item) => item !== record.text);
-      state.updated_at = record.updated_at; await this.storage.write(workspaceId, state); return state;
+      state.updated_at = record.updated_at; await this.storage.write(workspaceId, state); return projectTaskState(state);
     });
   }
 
@@ -321,7 +329,7 @@ export class TaskService {
       if (plan && await planBindingStale(this.storage, workspaceId, plan)) {
         throw new Error(`PLAN_STALE: Memory ${memory.id} is bound to an older specification`);
       }
-      if (plan && !(await reviewReceiptCurrent(workspaceId, plan, new WorkspaceRegistry()))) {
+      if (plan && !(await reviewReceiptCurrent(workspaceId, plan, new WorkspaceRegistry(), this.reviewTrust))) {
         throw new Error(`PLAN_REVIEW_REQUIRED: Memory ${memory.id} needs a current cumulative code-review-and-quality receipt`);
       }
     }

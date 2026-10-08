@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { PUBLIC_TOOL_NAMES, registerPublicTools } from "../src/mcp/tools.js";
 import { ToolRuntime } from "../src/mcp/runtime.js";
+import { formatToolResponse } from "../src/mcp/server.js";
 import { contextFindInput, contextInspectInput, memoryInput, planInput } from "../src/mcp/schemas.js";
 import { fixtureWorkspace } from "./helpers.js";
 import { resolveWorkspaceId } from "../src/workspace/registry.js";
@@ -23,8 +24,43 @@ test("public MCP schemas never expose workspace selection", () => {
   for (const option of planInput.options) assert.equal(Object.hasOwn(option.shape, "workspace"), false);
   assert.deepEqual(planInput.options.map((option) => option.shape.action.value), ["current", "create", "complete_current", "revise_current"]);
   assert.deepEqual(planInput.options.map((option) => Object.keys(option.shape).sort()), [
-    ["action"], ["action", "steps"], ["action"], ["action", "reason", "step"],
+    ["action", "item_id", "offset", "section", "state_token"], ["action", "steps"], ["action"], ["action", "reason", "step"],
   ]);
+});
+
+test("memory.current continuation survives the real runtime and MCP response envelope", async () => {
+  const env = await fixtureWorkspace("mcp-large-current");
+  try {
+    const runtime = new ToolRuntime();
+    const state = await runtime.tasks.create("planning", "Large memory");
+    const now = new Date().toISOString();
+    state.records = Array.from({ length: 400 }, (_, index) => ({ id: `M${index + 1}`, kind: "observation", text: `Observation ${index + 1} ${"x".repeat(70)}`,
+      status: "observed", confidence: "medium", evidence_refs: [], created_at: now, updated_at: now }));
+    state.next_record_id = 401; await runtime.tasks.storage.write("planning", state);
+    await runtime.tasks.setSpec("planning", { summary: "Large spec", requirements: Array.from({ length: 400 }, (_, index) => ({
+      statement: `Requirement ${index + 1} ${"y".repeat(70)}`, kind: "constraint", priority: "must" })) });
+    const initial = runtime.memory({ action: "current" });
+    const text = formatToolResponse(await initial).content[0]!.text;
+    assert.ok(Buffer.byteLength(text) <= 24_000);
+    const data = (JSON.parse(text) as { data: { memory: { id?: string; record_ids: string[]; spec: { requirement_ids: string[] } };
+      continuation: { state_token: string } }; truncated?: boolean }).data;
+    assert.equal(data.memory.id, undefined); assert.equal(data.memory.record_ids.length, 400);
+    assert.equal(data.memory.spec.requirement_ids.length, 400);
+    for (const section of ["records", "requirements"] as const) {
+      let offset = 0; const ids: string[] = [];
+      while (true) {
+        const pageText = formatToolResponse(await runtime.memory({ action: "current", section, offset,
+          state_token: data.continuation.state_token })).content[0]!.text;
+        assert.ok(Buffer.byteLength(pageText) <= 24_000);
+        const page = (JSON.parse(pageText) as { data: { items: Array<{ id: string }>; next_offset: number | null } }).data;
+        ids.push(...page.items.map((item) => item.id));
+        if (page.next_offset === null) break;
+        offset = page.next_offset;
+      }
+      assert.equal(ids.length, 400);
+      assert.equal(new Set(ids).size, 400);
+    }
+  } finally { await env.cleanup(); }
 });
 
 test("MCP find and inspect use the configured workspace and record inspection there", async () => {
@@ -52,7 +88,7 @@ test("public memory actions stay in the operator-selected workspace", async () =
   try {
     const runtime = new ToolRuntime();
     const created = await runtime.tasks.create("planning", "MCP memory");
-    assert.equal((await runtime.memory({ action: "current" }) as { memory: { id: string } }).memory.id, created.id);
+    assert.equal((await runtime.memory({ action: "current" }) as { memory: { title: string; id?: string } }).memory.id, undefined);
     assert.equal((await runtime.tasks.update("planning", created.id, { phase: "implementation" })).phase, "implementation");
     assert.equal((await runtime.memory({ action: "note", type: "observation", text: "Configured workspace note" }) as { saved: boolean }).saved, true);
     assert.equal((await runtime.tasks.transition("planning", "paused", created.id)).status, "paused");

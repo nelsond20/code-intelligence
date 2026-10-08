@@ -47,20 +47,18 @@ export const planStepInputSchema = z.object({
   writes: z.array(planWriteSchema).max(20).default([]),
   multi_file_justification: z.string().trim().min(1).max(2_000).optional(),
   context: z.array(planContextSchema).max(30).default([]),
-  acceptance: z.array(acceptanceInputSchema).min(1).max(30).describe("Required acceptance criteria; use objects with statement and covers for a structured spec"),
-  verification: z.array(planVerificationSchema).min(1).max(20).describe("Required verification entries, including for investigation steps; use kind, program, and args"),
+  acceptance: z.array(acceptanceInputSchema).max(30).default([]),
+  verification: z.array(planVerificationSchema).max(20).default([]),
 }).strict().superRefine((step, context) => {
   if (step.kind === "implementation" && step.writes.length === 0) context.addIssue({ code: z.ZodIssueCode.custom, path: ["writes"], message: "implementation steps require at least one write; effective kind is implementation (default when omitted). For read-only work set kind to investigation or verification." });
   if (step.kind !== "implementation" && step.writes.length > 0) context.addIssue({ code: z.ZodIssueCode.custom, path: ["writes"], message: `${step.kind} steps cannot authorize writes` });
-  if (step.writes.length >= 3 && !step.multi_file_justification) {
-    context.addIssue({ code: z.ZodIssueCode.custom, path: ["multi_file_justification"], message: "3 or more writable files require a bounded justification" });
-  }
 });
 
 const verificationStateSchema = planVerificationBaseSchema.extend({
   id: z.string().optional(),
   verified_generation: z.number().int().min(0).optional(),
   last_exit: z.number().int().optional(),
+  write_states: z.array(z.object({ repo: z.string(), path: z.string(), state: z.object({ kind: z.enum(["file", "missing", "other"]), hash: z.string().optional() }) })).optional(),
 });
 
 export const planStepSchema = z.object({
@@ -70,25 +68,51 @@ export const planStepSchema = z.object({
   verification: z.array(verificationStateSchema), status: z.enum(["pending", "current", "completed"]),
   mutation_generation: z.number().int().min(0),
   modified_paths: z.array(planWriteSchema.pick({ repo: true, path: true })).default([]),
+  write_baseline: z.array(z.object({ repo: z.string(), path: z.string(), state: z.object({ kind: z.enum(["file", "missing", "other"]), hash: z.string().optional() }) })).optional(),
+  plan_baseline: z.array(z.object({ repo: z.string(), path: z.string(), state: z.object({ kind: z.enum(["file", "missing", "other"]), hash: z.string().optional() }) })).optional(),
+  check_receipts: z.array(z.object({ id: z.string(), content_hash: z.string(), exit_code: z.number(), output: z.string() })).optional(),
   pending_mutation: z.object({ targets: z.array(z.object({ repo: z.string(), path: z.string(), hash: z.string().optional() })) }).optional(),
-  pending_shell: z.object({ files: z.array(z.object({ repo: z.string(), path: z.string(), hash: z.string() })) }).optional(),
+  pending_shell: z.union([
+    z.object({ files: z.array(z.object({ repo: z.string(), path: z.string(), hash: z.string() })) }),
+    z.object({ snapshot: z.string(), allowed_hashes: z.array(z.tuple([z.string(), z.string().nullable()])), snapshot_bytes: z.number().int() }),
+  ]).optional(),
   violations: z.array(z.object({ repo: z.string(), path: z.string(), reason: z.string(), at: z.string() })).default([]),
 });
+
+export const reviewReceiptSchema = z.object({
+  schema_version: z.literal(1), reviewer: z.literal("code-review-and-quality"),
+  memory_id: z.string(), plan_revision: z.number().int().min(1), spec_hash: z.string().length(64),
+  spec_revision: z.number().int().min(1).optional(), code_hash: z.string().length(64),
+  reviewed_scope: z.array(z.string()), reviewed_at: z.string(),
+  findings: z.array(z.object({ id: z.string(), severity: z.enum(["Critical", "Required", "Nit", "Optional", "Consider", "FYI"]),
+    summary: z.string(), disposition: z.enum(["open", "resolved", "handled"]), reason: z.string().optional(),
+    covers: z.array(z.string()).optional() }).strict()),
+  blocking_finding_count: z.number().int().min(0), verdict: z.enum(["Approve", "Request changes"]),
+  verifications: z.array(z.object({ kind: z.enum(["test", "typecheck", "lint", "build", "custom"]),
+    command: z.string(), result: z.enum(["pass", "fail"]), details: z.string().optional() }).strict()),
+  verification_story: z.string().min(1), signature: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+const legacyReviewReceiptSchema = z.object({ skill: z.literal("code-review-and-quality"), code_hash: z.string().length(64), reviewed_at: z.string(),
+  status: z.literal("completed"), blocking_findings: z.literal(false), artifact: z.string().optional() });
 
 export const planStateSchema = z.object({
   schema_version: z.literal(1), memory_id: z.string(), spec_hash: z.string().length(64),
   spec_revision: z.number().int().min(1).optional(),
   revision: z.number().int().min(1), status: z.enum(["active", "suspended", "final_review", "completed", "abandoned"]), current_step: z.number().int().min(0),
   steps: z.array(planStepSchema).min(1),
+  // Creation-time repository content permits safe write-path corrections later.
+  repository_baseline: z.array(z.object({ repo: z.string(), files: z.array(z.object({ path: z.string(), hash: z.string() })) })).optional(),
   revisions: z.array(z.object({ revision: z.number().int(), reason: z.string(), at: z.string(), previous_step: planStepSchema.optional() })).max(20).default([]),
   lifecycle: z.array(z.object({ status: z.string(), reason: z.string().optional(), at: z.string() })).max(50).default([]),
   requirement_exceptions: z.array(z.object({ requirement_id: z.string(), reason: z.string() })).max(100).default([]),
   marker_exceptions: z.array(z.object({ repo: z.string(), path: z.string(), marker: z.string(), reason: z.string() })).max(100).default([]),
   final_evidence: z.object({ covered_requirements: z.array(z.string()), modified_paths: z.array(z.string()), verifications: z.array(z.string()), completed_at: z.string() }).optional(),
-  review_receipt: z.object({ skill: z.literal("code-review-and-quality"), code_hash: z.string().length(64), reviewed_at: z.string(),
-    status: z.literal("completed"), blocking_findings: z.literal(false), artifact: z.string().optional() }).optional(),
+  review_receipt: z.union([reviewReceiptSchema, legacyReviewReceiptSchema]).optional(),
   last_mutation_at: z.string().optional(),
   archived_at: z.string().optional(),
+  archived_previous_status: z.literal("final_review").optional(),
+  suspended_from_final_review: z.boolean().optional(),
+  imported_from: z.object({ memory_id: z.string(), plan_revision: z.number().int().min(1) }).optional(),
   created_at: z.string(), updated_at: z.string(),
 });
 

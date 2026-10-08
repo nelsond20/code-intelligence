@@ -19,8 +19,15 @@ test("four Qwen 0.24.7 skills are model-invocable and define the required transi
   }
   assert.match(bodies[2]!, /EnterPlanMode.*ExitPlanMode/);
   assert.match(bodies[2]!, /action: create[\s\S]*action: current/);
+  assert.match(bodies[2]!, /stage: planning[\s\S]*plan\.create/);
+  assert.match(bodies[2]!, /stage: planning[\s\S]*NEVER call `memory\.note`/);
+  assert.match(bodies[2]!, /bookkeeping\/progress observations/);
+  assert.match(bodies[2]!, /context\.find`\/`context\.inspect` only for a bounded missing detail/);
+  assert.match(bodies[2]!, /Do not reopen investigation/);
+  assert.match(bodies[2]!, /Do not call `memory\.resolve` or `memory\.spec_set` during planning/);
+  assert.match(bodies[0]!, /Never use `memory\.note` for tool-call bookkeeping/);
   assert.match(bodies[3]!, /Before ANY code mutation call Code Intelligence `plan\.current`/);
-  assert.match(bodies[3]!, /code-review-and-quality[\s\S]*plan\.complete_current/);
+  assert.match(bodies[3]!, /plan\.complete_current[\s\S]*code-review-and-quality/);
   assert.match(bodies[3]!, /cumulative plan delta[\s\S]*external review receipt/);
 });
 
@@ -81,7 +88,7 @@ test("persisted evidence, spec, plan and review state derive stage; plan guard b
     const target = fixture("backend/src/PlanningService.ts");
     assert.match((await guard.beforeMutation("planning", [target])).reason || "", /^PLAN_REQUIRED:/);
     assert.match((await guard.beforeShell("planning", "echo change > src/PlanningService.ts")).reason || "", /^PLAN_REQUIRED:/);
-    assert.equal((await guard.beforeShell("planning", "npm test")).allowed, true);
+    assert.match((await guard.beforeShell("planning", "npm test")).reason || "", /^PLAN_REQUIRED:/);
     const current = await runtime.memory({ action: "current" }) as any;
     assert.equal(current.required_skill, "code-intelligence-planning");
     await runtime.plan({ action: "create", steps: [{ kind: "implementation", title: "Implement behavior", objective: "Make behavior verified", covers: ["R1"],

@@ -98,6 +98,7 @@ function planContract(root: JsonObject | undefined) {
     verification_required: verification?.required,
     verification_kinds: field(verification, "properties", "kind", "enum"),
     write_required: write?.required,
+    write_type: write?.type,
     revise_step_present: field(root, "properties", "step") !== undefined,
   };
 }
@@ -108,7 +109,7 @@ function summarize(tool: DiagnosticTool | undefined, name: "memory" | "plan") {
     ? ["properties.action", "properties.summary", "properties.requirements", "properties.requirements.items.properties.statement",
       "properties.requirements.items.properties.kind", "properties.requirements.items.properties.priority"]
     : ["properties.steps", "properties.steps.items.properties.title", "properties.steps.items.properties.objective",
-      "properties.steps.items.properties.acceptance", "properties.steps.items.properties.verification"];
+      "properties.steps.items.properties.writes"];
   return { observed: Boolean(tool), schema_observed: Boolean(root), schema_sha256: hash(root), description_sha256: hash(tool?.description),
     description_length: tool?.description?.length ?? null,
     root_properties: Object.keys(object(root?.properties) || {}), root_required: Array.isArray(root?.required) ? root.required : [],

@@ -9,6 +9,7 @@ export const workspaceSchema = z.object({
   id: z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
   name: z.string().min(1),
   repositories: z.array(repositorySchema).default([]),
+  verification: z.array(z.enum(["lint", "typecheck", "build", "test"])).default([]),
 });
 
 export const configSchema = z.object({

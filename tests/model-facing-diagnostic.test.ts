@@ -53,7 +53,7 @@ test("schema diagnostic distinguishes published, searched, and unobserved initia
     const planResult = compareToolSchemas(serverTools, undefined, planInitial).find((item) => item.tool === "plan")!;
     assert.equal(planResult.initial_equals_tools_list, false);
     assert.equal(planResult.initial_plan_contract_preserved, true);
-    delete planSchema.properties.steps.items.properties.acceptance.items.type;
+    delete planSchema.properties.steps.items.properties.writes.items.type;
     assert.equal(compareToolSchemas(serverTools, undefined, planInitial).find((item) => item.tool === "plan")!.initial_plan_contract_preserved, false);
     assert.ok(compareToolSchemas(serverTools, searched).every((item) => item.initial.observed === false && item.initial_equals_tools_list === null));
     const normalized = structuredClone(listed.find((tool) => tool.name === "memory")!.inputSchema) as Record<string, any>;

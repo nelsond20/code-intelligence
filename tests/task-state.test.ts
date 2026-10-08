@@ -21,7 +21,8 @@ test("memory lifecycle, semantic notes, legacy migration, spec, and bounded comp
     await writeFile(statePath, `${JSON.stringify(legacy, null, 2)}\n`);
     const restarted = new TaskService(new TaskStorage(path.join(env.data, "workspaces")));
     const current = await restarted.current("planning");
-    assert.equal(current?.id, first.id); assert.equal(current?.active_hypotheses.length, 1); assert.equal(current?.confirmed_findings.length, 1);
+    assert.equal(current?.id, first.id); assert.equal(current?.active_hypotheses.length, 1);
+    assert.equal(current?.confirmed_findings.length, 0); assert.equal(current?.supported_findings.length, 1);
     assert.equal(Object.hasOwn(current || {}, "current_focus"), false); assert.equal(Object.hasOwn(current || {}, "next_actions"), false);
     assert.match(await restarted.storage.readSpec("planning", first.id), /R1.*Duration uses exact millisecond arithmetic/);
     await restarted.recordInspection("planning", { ref: "git://backend/commit/abcdef1", repo: "backend", commit: "abcdef1", files: ["src/PlanningService.ts"], symbols: ["calculateDuration"] });

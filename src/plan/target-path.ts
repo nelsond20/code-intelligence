@@ -10,30 +10,45 @@ function contained(root: string, candidate: string): string {
 
 /** Canonicalize a repository file target, including descendants of future directories. */
 export async function canonicalTarget(rootPath: string, requested: string, allowMissing: boolean): Promise<string> {
-  if (path.isAbsolute(requested)) throw new Error("Absolute writable paths are not allowed");
-  const normalized = path.posix.normalize(requested.replaceAll("\\", "/"));
-  if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) throw new Error("Path escapes the repository");
   const root = await realpath(rootPath);
+  const raw = requested.replaceAll("\\", "/");
+  // Absolute model paths are rooted at this repository, never its workspace parent.
+  const relativeInput = path.isAbsolute(raw) ? contained(root, raw) : raw;
+  if (!relativeInput || relativeInput === ".") throw new Error("Path escapes the repository");
   const policy = await RepositoryAccessPolicy.create(root);
-  policy.assertReadable(normalized);
-  const candidate = path.resolve(root, normalized);
-  contained(root, candidate);
-  let ancestor = candidate;
-  const missing: string[] = [];
-  let canonical: string;
-  while (true) {
-    try { canonical = await realpath(ancestor); break; }
+  let canonical = root;
+  for (const segment of relativeInput.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      canonical = path.dirname(canonical);
+      if (canonical === root || canonical.startsWith(`${root}${path.sep}`)) continue;
+      throw new Error("Path escapes the repository");
+    }
+    const next = path.join(canonical, segment);
+    let resolved = false;
+    try { canonical = await realpath(next); resolved = true; }
     catch (error) {
       if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code || "")) throw error;
-      if (!allowMissing) throw new Error(`Context file does not exist: ${normalized}`);
-      if (ancestor === root) throw new Error("Path escapes the repository");
-      missing.unshift(path.basename(ancestor)); ancestor = path.dirname(ancestor);
+      if (!allowMissing) throw new Error(`Context file does not exist: ${relativeInput}`);
+      canonical = next;
+    }
+    if (canonical !== root) {
+      try { contained(root, canonical); }
+      catch { throw new Error(resolved ? "Symlink escapes the repository" : "Path escapes the repository"); }
     }
   }
-  if (missing.length) {
-    if (!(await stat(canonical)).isDirectory()) throw new Error(`Writable path has a non-directory ancestor: ${normalized}`);
-    canonical = path.join(canonical, ...missing);
-  } else if (!(await stat(canonical)).isFile()) throw new Error(`Writable path is not a regular file: ${normalized}`);
+  let ancestor = canonical;
+  while (true) {
+    try { const info = await stat(ancestor);
+      if (ancestor === canonical && !info.isFile()) throw new Error(`Writable path is not a regular file: ${relativeInput}`);
+      if (ancestor !== canonical && !info.isDirectory()) throw new Error(`Writable path has a non-directory ancestor: ${relativeInput}`);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" && (error as NodeJS.ErrnoException).code !== "ENOTDIR") throw error;
+      if (!allowMissing) throw new Error(`Context file does not exist: ${relativeInput}`);
+      ancestor = path.dirname(ancestor);
+    }
+  }
   let canonicalRelative: string;
   try { canonicalRelative = contained(root, canonical); }
   catch { throw new Error("Symlink escapes the repository"); }

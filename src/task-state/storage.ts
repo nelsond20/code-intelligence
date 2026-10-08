@@ -3,6 +3,7 @@ import { readdir, rm } from "node:fs/promises";
 import { atomicWrite, purgeDirectory, readTextIfExists, withFileLock } from "../shared/fs.js";
 import { structuredSpecSchema, taskStateSchema, type StructuredSpec, type TaskState } from "./schemas.js";
 import { appPaths, assertSafeId } from "../workspace/paths.js";
+import { projectTaskState } from "./projection.js";
 
 export class TaskStorage {
   constructor(private readonly root = appPaths().workspaceDir) {}
@@ -102,11 +103,19 @@ export class TaskStorage {
     await this.recoverTransaction(workspaceId, taskId);
     const raw = await readTextIfExists(this.statePath(workspaceId, taskId));
     if (raw === undefined) throw new Error(`Unknown memory: ${taskId}`);
-    return taskStateSchema.parse(JSON.parse(raw));
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    const outcome = value.outcome as Record<string, unknown> | undefined;
+    if (outcome && outcome.provenance_version !== 2) {
+      value.outcome = { ...outcome, evidence_refs: [], modified_paths: [], verifications: [], provenance_version: 2,
+        legacy_unclassified: outcome.legacy_unclassified || outcome.evidence_refs || [] };
+    }
+    return projectTaskState(taskStateSchema.parse(value));
   }
 
   async write(workspaceId: string, state: TaskState): Promise<void> {
-    const parsed = taskStateSchema.parse(state);
+    // Legacy persisted projections are ignored. Records are the sole current truth.
+    const parsed = taskStateSchema.parse({ ...state, confirmed_findings: [], supported_findings: [], active_hypotheses: [],
+      rejected_hypotheses: [], open_questions: [], blockers: [] });
     const target = this.statePath(workspaceId, state.id); const previous = await readTextIfExists(target);
     if (previous !== undefined) await atomicWrite(`${target}.backup`, previous);
     await atomicWrite(target, `${JSON.stringify(parsed, null, 2)}\n`);

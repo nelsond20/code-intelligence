@@ -35,6 +35,14 @@ test("external source timeouts have safe defaults and round-trip independently",
   assert.throws(() => parseConfigToml(serializeConfigToml(config).replace("timeout_ms = 44444", "timeout_ms = 99")), /greater than or equal to 100/);
 });
 
+test("workspace verification policy round-trips and defaults to no required checks", () => {
+  const config = defaultConfig();
+  config.workspaces.push({ id: "app", name: "App", repositories: [{ id: "repo", path: "/repo" }], verification: ["lint", "build"] });
+  const parsed = parseConfigToml(serializeConfigToml(config));
+  assert.deepEqual(parsed.workspaces[0]?.verification, ["lint", "build"]);
+  assert.deepEqual(parseConfigToml('[[workspaces]]\nid = "old"\nname = "Old"\n').workspaces[0]?.verification, []);
+});
+
 test("semantic requests use the configured embedding timeout", async () => {
   const config = defaultConfig(); config.embeddings.timeout_ms = 100;
   let receivedSignal: AbortSignal | undefined;

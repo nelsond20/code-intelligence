@@ -122,8 +122,7 @@ test("legacy runtime vectors cannot crowd out live semantic results", async () =
     const vectors = JSON.parse(await readFile(vectorPath, "utf8")) as { vectors: number[][] };
     vectors.vectors.unshift([1, 0]);
     await writeFile(vectorPath, JSON.stringify(vectors));
-    const results = await semantic.search([repo], "preflightSentinel", 1, embed);
-    assert.deepEqual(results.map((item) => item.path), ["sentinel.mjs"]);
+    await assert.rejects(semantic.search([repo], "preflightSentinel", 1, embed), /incompatible.*rebuild/);
   } finally { await env.cleanup(); }
 });
 
@@ -158,7 +157,7 @@ test("semantic index stores metadata without source and supports mocked embeddin
     assert.equal(manifest.chunk_schema, 3);
     delete manifest.chunk_schema; await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
     assert.equal(await semantic.status(repo), "stale");
-    assert.deepEqual(await semantic.search([repo], "duration", 3, embed), []);
+    await assert.rejects(semantic.search([repo], "duration", 3, embed), /incompatible.*rebuild/);
     assert.equal((await semantic.index(repo, false, embed)).reused, 0, "obsolete chunk schemas must be rebuilt, not reused");
   } finally { await env.cleanup(); }
 });

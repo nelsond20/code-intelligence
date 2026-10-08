@@ -25,6 +25,14 @@ export async function controlRoute(method: string, pathname: string, query: URLS
       return control.create(workspace, value.phase, value.title);
     }
   }
+  const importMatch = /^\/api\/memories\/([a-z0-9][a-z0-9-]*)\/import$/.exec(pathname);
+  if (importMatch) {
+    if (method !== "POST") throw new Error("Unsupported method");
+    const value = workspaceBody.extend({ source_id: z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
+      notes: z.boolean(), spec: z.boolean(), plan: z.boolean(),
+      plan_archive_id: z.string().regex(/^[a-f0-9]{16}$/).optional(), spec_revision: z.number().int().min(1).optional() }).strict().parse(body);
+    return control.importFromMemory(workspace, importMatch[1]!, value.source_id, value);
+  }
   const noteManage = /^\/api\/memories\/([a-z0-9][a-z0-9-]*)\/notes\/(M[1-9][0-9]*)\/(archive|restore|delete)$/.exec(pathname);
   if (noteManage) {
     if (method !== "POST") throw new Error("Unsupported method");
@@ -45,6 +53,13 @@ export async function controlRoute(method: string, pathname: string, query: URLS
     workspaceBody.strict().parse(body);
     return planManage[2] === "delete" ? control.deletePlan(workspace, planManage[1]!)
       : control.archivePlan(workspace, planManage[1]!, planManage[2] === "archive");
+  }
+  const planStatus = /^\/api\/memories\/([a-z0-9][a-z0-9-]*)\/plan\/status$/.exec(pathname);
+  if (planStatus) {
+    if (method !== "POST") throw new Error("Unsupported method");
+    const value = workspaceBody.extend({ status: z.enum(["active", "suspended", "final_review", "completed", "abandoned"]),
+      reason: z.string().trim().max(2_000).optional() }).strict().parse(body);
+    return control.planSetStatus(workspace, planStatus[1]!, value.status, value.reason);
   }
   const planMatch = /^\/api\/memories\/([a-z0-9][a-z0-9-]*)\/plan(?:\/(suspend|reactivate|abandon|finish|resolve-write|allow-marker))?$/.exec(pathname);
   if (planMatch) {

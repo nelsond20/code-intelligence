@@ -14,7 +14,7 @@ import { languageForPath, parseSymbols } from "../symbols/parser.js";
 
 interface VectorMetadata { repo: string; path: string; start_line: number; end_line: number; hash: string; file_hash?: string; chunk_id?: string; symbol?: string; }
 interface StoredIndex { schema_version: 2; provider?: "ollama" | "llamacpp"; model: string; dimensions: number; vectors: number[][]; }
-interface IndexManifest { schema_version: 2; chunk_schema?: number; workspace: string; repo: string; root_fingerprint: string; generation: string; provider: string; model: string; dimensions: number; vectors: number; created_at: string; }
+interface IndexManifest { schema_version: 2; chunk_schema?: number; workspace: string; repo: string; root_fingerprint: string; generation: string; provider: string; model: string; dimensions: number; vectors: number; source_files?: string[]; created_at: string; }
 export type Embedder = (texts: string[]) => Promise<number[][]>;
 export type IndexProgress =
   | { phase: "scanning" }
@@ -43,9 +43,9 @@ function buildLlamaCppBatches(texts: string[], maxTexts: number, maxTokensEstima
 }
 
 function cosine(a: number[], b: number[]): number {
+  if (a.length !== b.length) throw new Error("Semantic index dimension mismatch; rebuild the index");
   let dot = 0, aa = 0, bb = 0;
-  const length = Math.min(a.length, b.length);
-  for (let i = 0; i < length; i++) { dot += a[i]! * b[i]!; aa += a[i]! ** 2; bb += b[i]! ** 2; }
+  for (let i = 0; i < a.length; i++) { dot += a[i]! * b[i]!; aa += a[i]! ** 2; bb += b[i]! ** 2; }
   return aa && bb ? dot / Math.sqrt(aa * bb) : 0;
 }
 
@@ -69,6 +69,14 @@ export class SemanticIndex {
     if (value.schema_version !== 2 || value.workspace !== this.workspaceId || value.repo !== repository.id
       || value.root_fingerprint !== this.paths(repository).fingerprint) throw new Error(`Semantic index identity mismatch for ${repository.id}`);
     return value;
+  }
+
+  private compatible(repository: Repository, manifest: IndexManifest, index: StoredIndex): void {
+    if (manifest.chunk_schema !== CHUNK_SCHEMA || manifest.provider !== this.config.embeddings.provider
+      || manifest.model !== this.config.embeddings.model || index.provider !== manifest.provider
+      || index.model !== manifest.model || index.dimensions !== manifest.dimensions || manifest.vectors !== index.vectors.length) {
+      throw new Error(`Semantic index is incompatible for ${repository.id}; rebuild the index`);
+    }
   }
 
   embedder(): Embedder {
@@ -124,8 +132,10 @@ export class SemanticIndex {
     await mkdir(base.root, { recursive: true, mode: 0o700 });
     const previousMetadata = force ? [] : await this.readMetadata(repository);
     const previousIndex = force ? undefined : await this.readVectors(repository);
-    const previousProvider = previousIndex?.provider || "ollama";
+    const previousProvider = previousIndex?.provider;
     const canReuse = previousManifest?.chunk_schema === CHUNK_SCHEMA
+      && previousManifest.provider === this.config.embeddings.provider && previousManifest.model === this.config.embeddings.model
+      && previousManifest.dimensions === previousIndex?.dimensions
       && previousIndex?.model === this.config.embeddings.model && previousProvider === this.config.embeddings.provider;
     const metadataKey = (meta: VectorMetadata) => meta.chunk_id || `${meta.path}:${meta.start_line}:${meta.end_line}:${meta.hash}`;
     const reusable = new Map(previousMetadata.map((meta, index) => [metadataKey(meta), canReuse ? previousIndex?.vectors[index] : undefined]));
@@ -189,22 +199,31 @@ export class SemanticIndex {
       model: this.config.embeddings.model, dimensions, vectors } satisfies StoredIndex));
     await atomicWrite(base.manifest, `${JSON.stringify({ schema_version: 2, chunk_schema: CHUNK_SCHEMA, workspace: this.workspaceId, repo: repository.id,
       root_fingerprint: base.fingerprint, generation, provider: this.config.embeddings.provider, model: this.config.embeddings.model,
-      dimensions, vectors: vectors.length, created_at: new Date().toISOString() } satisfies IndexManifest, null, 2)}\n`);
+      dimensions, vectors: vectors.length, source_files: files, created_at: new Date().toISOString() } satisfies IndexManifest, null, 2)}\n`);
     onProgress?.({ phase: "complete", completed: pending.length, total: pending.length, reused,
       files: files.length, elapsed_ms: performance.now() - startedAt });
     return { chunks: metadata.length, files: files.length, reused };
   }
 
   async search(repositories: Repository[], query: string, limit: number, customEmbedder?: Embedder): Promise<SearchResult[]> {
+    const candidates: Array<{ repository: Repository; metadata: VectorMetadata[]; index: StoredIndex }> = [];
+    for (const repository of repositories) {
+      const manifest = await this.manifest(repository);
+      if (!manifest) continue;
+      if (manifest.chunk_schema !== CHUNK_SCHEMA) throw new Error(`Semantic index is incompatible for ${repository.id}; rebuild the index`);
+      const metadata = await this.readMetadata(repository);
+      const index = await this.readVectors(repository);
+      if (!index) throw new Error(`Semantic index is incomplete for ${repository.id}; rebuild the index`);
+      this.compatible(repository, manifest, index);
+      if (metadata.length !== index.vectors.length || index.vectors.some((vector) => vector.length !== index.dimensions)) throw new Error(`Semantic index is inconsistent for ${repository.id}`);
+      candidates.push({ repository, metadata, index });
+    }
+    if (!candidates.length) return [];
     const [queryVector] = await (customEmbedder || this.embedder())([query]);
     if (!queryVector) throw new Error("Embedding provider returned no query vector");
     const scored: { metadata: VectorMetadata; score: number; repository: Repository }[] = [];
-    for (const repository of repositories) {
-      if ((await this.manifest(repository))?.chunk_schema !== CHUNK_SCHEMA) continue;
-      const metadata = await this.readMetadata(repository);
-      const index = await this.readVectors(repository);
-      if (!index) continue;
-      if (metadata.length !== index.vectors.length || index.vectors.some((vector) => vector.length !== index.dimensions)) throw new Error(`Semantic index is inconsistent for ${repository.id}`);
+    for (const { repository, metadata, index } of candidates) {
+      if (queryVector.length !== index.dimensions) throw new Error(`Semantic query dimension is incompatible for ${repository.id}; rebuild the index`);
       metadata.forEach((item, position) => scored.push({ metadata: item, score: cosine(queryVector, index.vectors[position] || []), repository }));
     }
     const output: SearchResult[] = [];
@@ -226,17 +245,28 @@ export class SemanticIndex {
   async status(repository: Repository): Promise<"fresh" | "partial" | "stale" | "missing"> {
     const manifest = await this.manifest(repository);
     if (!manifest) return "missing";
-    if (manifest.chunk_schema !== CHUNK_SCHEMA) return "stale";
-    const metadata = await this.readMetadata(repository); let stale = 0;
+    if (manifest.chunk_schema !== CHUNK_SCHEMA || manifest.provider !== this.config.embeddings.provider
+      || manifest.model !== this.config.embeddings.model) return "stale";
+    let index: StoredIndex | undefined;
+    try { index = await this.readVectors(repository); } catch { return "stale"; }
+    if (!index) return "stale";
+    try { this.compatible(repository, manifest, index); } catch { return "stale"; }
+    const metadata = await this.readMetadata(repository);
+    if (metadata.length !== index.vectors.length || index.vectors.some((vector) => vector.length !== index.dimensions)) return "stale";
+    let stale = 0;
     const byFile = new Map<string, string>();
     for (const item of metadata) if (item.file_hash) byFile.set(item.path, item.file_hash);
     const policy = await RepositoryAccessPolicy.create(repository.path);
+    const currentFiles = await walkSourceFiles(repository.path);
+    const indexedFiles = new Set(manifest.source_files || byFile.keys());
+    for (const file of currentFiles) if (!indexedFiles.has(file)) stale++;
+    for (const file of indexedFiles) if (!currentFiles.includes(file) && !byFile.has(file)) stale++;
     for (const [relative, hash] of byFile) {
       try {
         if (!policy.canRead(relative) || sourceHash(await readFile((await policy.resolveFile(relative)).absolute, "utf8")) !== hash) stale++;
       } catch { stale++; }
     }
-    return stale === 0 ? "fresh" : stale === byFile.size ? "stale" : "partial";
+    return stale === 0 ? "fresh" : stale >= new Set([...indexedFiles, ...currentFiles]).size ? "stale" : "partial";
   }
 
   private async readMetadata(repository: Repository): Promise<VectorMetadata[]> {
@@ -254,7 +284,8 @@ export class SemanticIndex {
     const raw = await readTextIfExists(this.paths(repository, manifest.generation).vectors!);
     if (!raw) return undefined;
     const value = JSON.parse(raw) as StoredIndex;
-    if (value.schema_version !== 2 || !Array.isArray(value.vectors) || !Number.isInteger(value.dimensions)) throw new Error("Invalid semantic vector index");
+    if (value.schema_version !== 2 || !Array.isArray(value.vectors) || !Number.isInteger(value.dimensions))
+      throw new Error(`Semantic index is incompatible for ${repository.id}; rebuild the index`);
     return value;
   }
 }

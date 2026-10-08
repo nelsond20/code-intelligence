@@ -1,8 +1,10 @@
 import type { TaskState } from "./schemas.js";
+import { projectTaskState } from "./projection.js";
 
 function compactList(values: string[], max = 12): string[] { return values.slice(0, max); }
 
 export function taskBootstrap(state: TaskState, findingsPath: string, specPath: string) {
+  state = projectTaskState(state);
   return {
     id: state.id,
     title: state.title,
@@ -10,6 +12,7 @@ export function taskBootstrap(state: TaskState, findingsPath: string, specPath: 
     objective: state.objective,
     phase: state.phase,
     confirmed_findings: compactList(state.confirmed_findings),
+    supported_findings: compactList(state.supported_findings),
     active_hypotheses: state.active_hypotheses.slice(0, 10),
     open_questions: compactList(state.open_questions),
     blockers: compactList(state.blockers),
@@ -18,7 +21,7 @@ export function taskBootstrap(state: TaskState, findingsPath: string, specPath: 
     inspected_refs: compactList(state.inspected_refs, 15),
     inspected_commits: state.inspected_commits.slice(0, 10),
     findings_path: findingsPath,
-    spec_path: specPath,
+    spec_path: state.spec_archived_at ? undefined : specPath,
     updated_at: state.updated_at,
   };
 }
@@ -36,6 +39,7 @@ export function renderTaskContext(state: TaskState, findingsPath: string, specPa
     ...bootstrap.blockers.map((v) => `Blocker: ${v}`),
     ...bootstrap.open_questions.map((v) => `Open question: ${v}`),
     ...bootstrap.confirmed_findings.map((v) => `Confirmed: ${v}`),
+    ...bootstrap.supported_findings.map((v) => `Supported: ${v}`),
     ...bootstrap.active_hypotheses.map((v) => `Hypothesis [${v.confidence}]: ${v.text}`),
     ...bootstrap.relevant_files.map((v) => `Relevant file: ${v.repo}:${v.path}`),
     ...bootstrap.relevant_symbols.map((v) => `Relevant symbol: ${v}`),

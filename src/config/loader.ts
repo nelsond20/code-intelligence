@@ -7,6 +7,11 @@ import { appPaths } from "../workspace/paths.js";
 
 function parseValue(raw: string): unknown {
   const value = raw.trim();
+  if (value.startsWith("[") && value.endsWith("]")) {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) throw new Error("Only string arrays are supported in TOML config");
+    return parsed;
+  }
   if (value === "true") return true;
   if (value === "false") return false;
   if (/^-?\d+$/.test(value)) return Number(value);
@@ -111,7 +116,8 @@ export function serializeConfigToml(config: CodeIntelligenceConfig): string {
     `output_max_bytes = ${config.limits.output_max_bytes}`,
   ];
   for (const workspace of config.workspaces) {
-    lines.push("", "[[workspaces]]", `id = ${quoted(workspace.id)}`, `name = ${quoted(workspace.name)}`);
+    lines.push("", "[[workspaces]]", `id = ${quoted(workspace.id)}`, `name = ${quoted(workspace.name)}`,
+      `verification = ${JSON.stringify(workspace.verification)}`);
     for (const repository of workspace.repositories) {
       lines.push("", "[[workspaces.repositories]]", `id = ${quoted(repository.id)}`, `path = ${quoted(repository.path)}`);
     }

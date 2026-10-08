@@ -35,7 +35,8 @@ test("plan requires active memory and confirmed spec, binds the hash internally,
     await runtime.tasks.setSpec("planning", { summary: "Duration calculations", requirements: [{ statement: "Preserve duration behavior", kind: "behavior", priority: "must" }] });
     const created = await runtime.plan({ action: "create", steps }) as any;
     assert.equal(created.active, true); assert.equal(created.step.id, "S1"); assert.equal(created.total, 2);
-    assert.deepEqual(created.step.acceptance[0], { id: "A1", statement: "Behavior is correct", covers: ["R1"], verification_ids: ["V1"] });
+    assert.deepEqual(created.step.writes, ["src/PlanningService.ts"]);
+    assert.equal(created.step.acceptance, undefined, "legacy persisted steps are compacted for the model");
     assert.doesNotMatch(JSON.stringify(created), /npm test -- shared/);
     const state = await runtime.plans.state("planning"); assert.match(state.plan?.spec_hash || "", /^[a-f0-9]{64}$/);
     const restarted = new ToolRuntime(); const resumed = await restarted.plan({ action: "current" }) as any;
@@ -133,11 +134,10 @@ test("plan paths reject unknown repositories, traversal, absolute and symlink es
     const base = step("S1", "repo", "src/a.ts", "npm test");
     await assert.rejects(plans.create("planning", [{ ...base, writes: [{ repo: "missing", path: "src/a.ts" }] }]), /Unknown repository/);
     await assert.rejects(plans.create("planning", [{ ...base, writes: [{ repo: "repo", path: "../outside.ts" }] }]), /escapes/);
-    await assert.rejects(plans.create("planning", [{ ...base, writes: [{ repo: "repo", path: outside }] }]), /Absolute/);
+    await assert.rejects(plans.create("planning", [{ ...base, writes: [{ repo: "repo", path: outside }] }]), /escapes/);
     await assert.rejects(plans.create("planning", [{ ...base, writes: [{ repo: "repo", path: "src/escape.ts" }] }]), /Symlink escapes/);
     const writes = ["a.ts", "b.ts", "c.ts"].map((name) => ({ repo: "repo", path: `src/${name}`, covers: ["R1"] }));
-    await assert.rejects(plans.create("planning", [{ ...base, writes }]), /3 or more writable files require/);
-    const accepted = await plans.create("planning", [{ ...base, writes, multi_file_justification: "One atomic generated contract update across three tightly coupled files." }]);
+    const accepted = await plans.create("planning", [{ ...base, writes }]);
     assert.equal(accepted.steps[0]?.writes.length, 3);
     const symlinkMutation = await new PlanGuard(plans, registry).beforeMutation("planning", [path.join(repo, "src", "escape.ts")]);
     assert.equal(symlinkMutation.allowed, false); assert.match(symlinkMutation.reason || "", /Symlink escapes the repository/);

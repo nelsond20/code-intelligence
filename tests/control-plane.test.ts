@@ -7,6 +7,8 @@ import { controlRoute, isControlPagePath } from "../src/control/server.js";
 import { controlPage } from "../src/control/page.js";
 import { memoryInput, parseMemoryAction } from "../src/mcp/schemas.js";
 import { PlanService } from "../src/plan/service.js";
+import { PlanGuard } from "../src/plan/guard.js";
+import { deriveStage } from "../src/orchestration/stage.js";
 import vm from "node:vm";
 
 test("flat memory transport dispatches strict selected-action validation", () => {
@@ -200,6 +202,8 @@ test("control transitions restore memory and plan after partial writes", async (
 
 test("control page has search, filters, tabs, confirmations, and title fields", () => {
   const page = controlPage("test-token");
+  assert.match(page, /Requirement traceability/);
+  assert.match(page, /Structural coverage only/);
   assert.match(page, /type="search"/);
   for (const id of ["workspace", "status", "phase", "has_spec", "spec_archived", "unresolved", "modified", "sort", "dialog", "revision"]) assert.ok(page.includes(id));
   for (const tab of ["overview", "specification", "notes", "history"]) assert.ok(page.includes(tab));
@@ -215,6 +219,216 @@ test("control page has search, filters, tabs, confirmations, and title fields", 
   assert.match(page, /spec archived/);
   assert.match(page, /href="'\+esc\(pagePath/);
   assert.match(page, /memoryListLink/);
+  assert.match(page, /importMemory/);
+  assert.match(page, /Plan and its specification/);
+  assert.match(page, /data-reuse-spec/);
+  assert.match(page, /data-reuse-plan/);
+});
+
+test("the plan tab shows Archive plan and confirms a selected status change", () => {
+  const script = controlPage("test-token").match(/<script[^>]*>([\s\S]*?)<\/script>/)?.[1]!;
+  const helpers = script.slice(0, script.indexOf("function renderSpec"));
+  type Stub = { value: string; innerHTML: string; onclick?: () => void; onchange?: () => void; disabled?: boolean; textContent?: string; showModal?: () => void };
+  const elements = new Map<string, Stub>([["planStatus", { value: "active", innerHTML: "" }]]);
+  const document = { getElementById(id: string) {
+    if (!elements.has(id)) elements.set(id, { value: "no", innerHTML: "", showModal() {} });
+    return elements.get(id)!;
+  }, querySelectorAll() { return []; } };
+  const html = vm.runInNewContext(`${helpers}\nworkspace='planning';selected='task-1';tab='plan';detail={memory:{id:'task-1',title:'Task',status:'active',updated_at:'2026-01-01',records:[]},plan:{plan:{status:'active',spec_revision:1,steps:[{id:'S1',title:'Step',objective:'Work',status:'current',kind:'investigation',covers:[],writes:[],modified_paths:[]}]},stale:false,review_gate:'pending',traceability:[],unresolved_markers:[]}};render();$('detail').innerHTML`, {
+    document, window: { addEventListener() {} }, location: { pathname: "/", search: "" },
+    history: { pushState() {}, replaceState() {} }, URLSearchParams,
+  }) as string;
+  assert.match(html, /data-manage="plan:archive">Archive plan/);
+  for (const status of ["active", "suspended", "final_review", "completed", "abandoned"]) assert.match(html, new RegExp(`value="${status}"`));
+  assert.equal(elements.get("changePlanStatus")?.disabled, true);
+  elements.get("planStatus")!.value = "suspended";
+  elements.get("planStatus")!.onchange?.();
+  assert.equal(elements.get("changePlanStatus")?.disabled, false);
+  elements.get("changePlanStatus")!.onclick?.();
+  assert.match(elements.get("dialogText")?.textContent || "", /Change from active to suspended/);
+  assert.match(elements.get("dialogText")?.textContent || "", /does not run checks/);
+});
+
+test("multiple archived specifications remain available while a new spec is created", async () => {
+  const env = await fixtureWorkspace("control-multiple-specs");
+  try {
+    const control = new MemoryControlService();
+    const memory = await control.create("planning", "investigation", "Spec archive");
+    await control.activate("planning", memory.id);
+    const guard = new PlanGuard(control.plans);
+    for (const summary of ["First", "Second"]) {
+      await control.tasks.setSpec("planning", { summary, requirements: [{ statement: summary, kind: "constraint", priority: "must" }] });
+      assert.equal((await guard.beforeShell("planning", "node --version")).allowed, false);
+      await control.archiveSpec("planning", memory.id, true);
+      assert.equal((await deriveStage(control.plans, "planning")).stage, "investigation");
+      assert.equal((await guard.beforeShell("planning", "node --version")).allowed, true);
+    }
+    const third = await control.tasks.setSpec("planning", { summary: "Third", requirements: [{ statement: "Third", kind: "constraint", priority: "must" }] });
+    const detail = await control.detail("planning", memory.id);
+    assert.equal(third.spec.revision, 3);
+    assert.equal(detail.memory.spec_archived_at, undefined);
+    assert.deepEqual(detail.archived_specs.map((spec) => spec.summary), ["First", "Second"]);
+    assert.equal(detail.memory.spec?.summary, "Third");
+    assert.equal((await deriveStage(control.plans, "planning")).stage, "planning");
+    const target = await control.create("planning", "investigation", "Imported old spec");
+    await control.importFromMemory("planning", target.id, memory.id, { notes: false, spec: true, plan: false, spec_revision: 1 });
+    assert.equal((await control.tasks.read("planning", target.id)).spec?.summary, "First");
+    await controlRoute("POST", `/api/memories/${memory.id}/import`, new URLSearchParams({ workspace: "planning" }),
+      { workspace: "planning", source_id: memory.id, notes: false, spec: true, plan: false, spec_revision: 1 }, control);
+    const reused = await control.detail("planning", memory.id);
+    assert.equal(reused.memory.spec?.revision, 4);
+    assert.equal(reused.memory.spec?.summary, "First");
+    assert.deepEqual(reused.archived_specs.map((spec) => spec.summary), ["First", "Second", "Third"]);
+  } finally { await env.cleanup(); }
+});
+
+test("multiple archived plans remain in history when another plan is created", async () => {
+  const env = await fixtureWorkspace("control-multiple-plans");
+  try {
+    const control = new MemoryControlService();
+    const memory = await control.create("planning", "investigation", "Plan archive");
+    await control.activate("planning", memory.id);
+    await control.tasks.setSpec("planning", { summary: "Inspect", requirements: [{ statement: "Inspect", kind: "constraint", priority: "must" }] });
+    for (const title of ["First", "Second"]) {
+      await control.plans.create("planning", [{ kind: "investigation", title, objective: title, covers: ["R1"],
+        acceptance: [{ statement: "Done", covers: ["R1"] }], verification: [{ kind: "custom", program: "node", args: ["--version"] }] }]);
+      await control.planTransition("planning", memory.id, "suspend");
+      await control.archivePlan("planning", memory.id, true);
+      assert.equal((await deriveStage(control.plans, "planning")).stage, "planning");
+    }
+    await control.plans.create("planning", [{ kind: "investigation", title: "Third", objective: "Third", covers: ["R1"],
+      acceptance: [{ statement: "Done", covers: ["R1"] }], verification: [{ kind: "custom", program: "node", args: ["--version"] }] }]);
+    const detail = await control.detail("planning", memory.id);
+    assert.deepEqual(detail.archived_plans.map((plan) => plan.steps[0]?.title).sort(), ["First", "Second"]);
+    assert.equal(detail.plan.plan?.steps[0]?.title, "Third");
+    const first = detail.archived_plan_entries.find((entry) => entry.plan.steps[0]?.title === "First");
+    assert.ok(first);
+    const target = await control.create("planning", "investigation", "Imported old plan");
+    await control.importFromMemory("planning", target.id, memory.id,
+      { notes: false, spec: false, plan: true, plan_archive_id: first.id });
+    assert.equal((await control.planStorage.read("planning", target.id))?.steps[0]?.title, "First");
+    assert.equal((await control.tasks.read("planning", target.id)).spec?.summary, "Inspect");
+    await assert.rejects(control.importFromMemory("planning", memory.id, memory.id,
+      { notes: false, spec: false, plan: true, plan_archive_id: first.id }), /current plan/);
+    await control.planTransition("planning", memory.id, "suspend");
+    await control.archivePlan("planning", memory.id, true);
+    await controlRoute("POST", `/api/memories/${memory.id}/import`, new URLSearchParams({ workspace: "planning" }),
+      { workspace: "planning", source_id: memory.id, notes: false, spec: false, plan: true, plan_archive_id: first.id }, control);
+    const reused = await control.detail("planning", memory.id);
+    assert.equal(reused.memory.spec?.revision, 2);
+    assert.equal(reused.plan.plan?.steps[0]?.title, "First");
+    assert.equal(reused.plan.plan?.status, "suspended");
+    assert.equal(reused.plan.stale, false);
+    assert.ok(reused.archived_plans.some((plan) => plan.steps[0]?.title === "Third"));
+  } finally { await env.cleanup(); }
+});
+
+test("archiving a plan in final review pauses it and restoring resumes final review", async () => {
+  const env = await fixtureWorkspace("control-archive-final-review");
+  try {
+    const control = new MemoryControlService();
+    const memory = await control.create("planning", "investigation", "Review archive");
+    await control.activate("planning", memory.id);
+    await control.tasks.setSpec("planning", { summary: "Review", requirements: [{ statement: "Inspect", kind: "constraint", priority: "must" }] });
+    const plan = await control.plans.create("planning", [{ kind: "investigation", title: "Inspect", objective: "Inspect", covers: ["R1"],
+      acceptance: [{ statement: "Done", covers: ["R1"] }], verification: [{ kind: "custom", program: "node", args: ["--version"] }] }]);
+    plan.status = "final_review";
+    plan.steps[0]!.status = "completed";
+    await control.planStorage.write("planning", plan);
+    const archived = await control.archivePlan("planning", memory.id, true);
+    assert.equal(archived.status, "suspended");
+    assert.equal(archived.archived_previous_status, "final_review");
+    assert.equal((await deriveStage(control.plans, "planning")).stage, "planning");
+    const restored = await control.archivePlan("planning", memory.id, false);
+    assert.equal(restored.status, "final_review");
+    assert.equal(restored.archived_previous_status, undefined);
+    assert.equal((await deriveStage(control.plans, "planning")).stage, "final_review");
+  } finally { await env.cleanup(); }
+});
+
+test("UI plan status route accepts every manual transition without fabricating review evidence", async () => {
+  const env = await fixtureWorkspace("control-plan-status");
+  try {
+    const control = new MemoryControlService();
+    const memory = await control.create("planning", "investigation", "Status choices");
+    await control.activate("planning", memory.id);
+    await control.tasks.setSpec("planning", { summary: "Inspect", requirements: [{ statement: "Inspect", kind: "constraint", priority: "must" }] });
+    await control.plans.create("planning", [{ kind: "investigation", title: "Inspect", objective: "Inspect", covers: ["R1"],
+      acceptance: [{ statement: "Done", covers: ["R1"] }], verification: [{ kind: "custom", program: "node", args: ["--version"] }] }]);
+    const plan = (await control.planStorage.read("planning", memory.id))!;
+    plan.final_evidence = { covered_requirements: ["R1"], modified_paths: [], verifications: [], completed_at: new Date().toISOString() };
+    plan.review_receipt = { skill: "code-review-and-quality", code_hash: "0".repeat(64), reviewed_at: new Date().toISOString(), status: "completed", blocking_findings: false };
+    await control.planStorage.write("planning", plan);
+    const route = (status: string, reason = "Operator confirmed") => controlRoute("POST", `/api/memories/${memory.id}/plan/status`,
+      new URLSearchParams({ workspace: "planning" }), { workspace: "planning", status, reason }, control);
+    for (const status of ["final_review", "completed", "active", "abandoned", "suspended", "completed"] as const) {
+      const updated = await route(status, "") as { status: string; review_receipt?: unknown; final_evidence?: unknown };
+      assert.equal(updated.status, status);
+      assert.equal(updated.review_receipt, undefined);
+      assert.equal(updated.final_evidence, undefined);
+    }
+    assert.equal((await control.plans.inspect("planning", memory.id)).receipt_current, false);
+    await assert.rejects(control.complete("planning", memory.id), /PLAN_REVIEW_REQUIRED/);
+    await control.archivePlan("planning", memory.id, true);
+    const restored = await route("active") as { status: string; archived_at?: string; steps: Array<{ status: string }> };
+    assert.equal(restored.status, "active");
+    assert.equal(restored.archived_at, undefined);
+    assert.equal(restored.steps[0]?.status, "current");
+    assert.equal((await control.plans.inspect("planning", memory.id)).review_gate, "not_ready");
+    await assert.rejects(route("invalid"), /active|suspended|final_review|completed|abandoned/);
+  } finally { await env.cleanup(); }
+});
+
+test("import copies notes with fresh IDs and a plan with its bound spec", async () => {
+  const env = await fixtureWorkspace("control-import-memory");
+  try {
+    const control = new MemoryControlService();
+    const source = await control.create("planning", "investigation", "Source");
+    const target = await control.create("planning", "investigation", "Target");
+    await control.activate("planning", source.id);
+    await control.tasks.note("planning", { type: "observation", text: "Useful finding" });
+    await control.tasks.note("planning", { type: "observation", text: "Useful finding" });
+    await control.tasks.setSpec("planning", { summary: "Original", requirements: [{ statement: "Inspect", kind: "constraint", priority: "must" }] });
+    await control.plans.create("planning", [{ kind: "investigation", title: "Inspect source", objective: "Inspect", covers: ["R1"],
+      acceptance: [{ statement: "Done", covers: ["R1"] }], verification: [{ kind: "custom", program: "node", args: ["--version"] }] }]);
+    await control.tasks.setSpec("planning", { summary: "Changed later", requirements: [{ id: "R1", statement: "Different", kind: "constraint", priority: "must" }] });
+    const q = new URLSearchParams({ workspace: "planning" });
+    const result = await controlRoute("POST", `/api/memories/${target.id}/import`, q,
+      { workspace: "planning", source_id: source.id, notes: true, spec: false, plan: true }, control) as { imported_notes: number; plan_status: string };
+    assert.equal(result.imported_notes, 2);
+    assert.equal(result.plan_status, "suspended");
+    const detail = await control.detail("planning", target.id);
+    assert.equal(detail.memory.spec?.summary, "Original");
+    assert.equal(detail.plan.stale, false);
+    assert.equal(detail.memory.records[0]?.id, "M1");
+    assert.equal(detail.memory.records[0]?.text, "Useful finding");
+    assert.deepEqual(detail.memory.records[0]?.evidence_refs, []);
+    assert.equal(detail.memory.records[1]?.id, "M2");
+    await control.deleteNote("planning", target.id, "M2");
+    const findings = await import("node:fs/promises").then(({ readFile }) => readFile(control.tasks.storage.findingsPath("planning", target.id), "utf8"));
+    assert.match(findings, new RegExp(detail.memory.records[0]!.created_at));
+    assert.doesNotMatch(findings, new RegExp(detail.memory.records[1]!.created_at));
+    await control.activate("planning", target.id, "suspend");
+    await control.planTransition("planning", target.id, "reactivate");
+    assert.equal((await control.planStorage.read("planning", target.id))?.status, "active");
+    assert.ok((await control.planStorage.read("planning", target.id))?.repository_baseline);
+    await assert.rejects(control.importFromMemory("planning", source.id, source.id, { notes: true, spec: false, plan: false }), /saved specification revision or plan/);
+  } finally { await env.cleanup(); }
+});
+
+test("operator traceability renders changed paths, executed results, missing links and blocked review", () => {
+  const renderer = controlPage("test-token").match(/^function renderTraceability\(info\).*$/m)?.[0];
+  assert.ok(renderer);
+  const render = vm.runInNewContext(`const esc=s=>String(s);${renderer};renderTraceability`, {}) as (value: unknown) => string;
+  const html = render({ traceability: [{ requirement_id: "R1", statement: "Feature works", review_status: "blocked or stale",
+    steps: [{ step_id: "S1", title: "Implement feature", kind: "implementation", status: "completed",
+      modified_paths: ["repo:src/feature.ts"], verifications: [{ command: "npm test", result: "pass", last_exit: 0, expected_exit: 0 }], gaps: [] },
+    { step_id: "S2", title: "Check feature", kind: "verification", status: "current", modified_paths: [], verifications: [],
+      gaps: ["No verification linked to this requirement"] }],
+    gaps: ["Review receipt is blocked or stale"],
+    review_findings: [{ severity: "Required", disposition: "open", summary: "Missing case" }] }] });
+  for (const text of ["R1", "S1 · Implement feature", "repo:src/feature.ts", "Verification: npm test · pass (exit 0, expected 0)",
+    "No verification linked to this requirement", "Review receipt is blocked or stale", "Required · open: Missing case"]) assert.ok(html.includes(text));
 });
 
 test("control UI routes provide deep links for workspaces, memories, tabs, archived notes, and archived specs", () => {
@@ -262,6 +476,10 @@ test("specification filter hides archived specs by default and shows them when s
   assert.match(result.all, /Archived summary/);
   assert.match(result.visible, /Archived summary/);
   assert.match(result.visible, /Archive spec/);
+  archive.value = "yes";
+  const saved = vm.runInNewContext("detail={memory:{id:'task-1',status:'paused',spec:{revision:3,summary:'Current',requirements:[]}},legacy_spec:null,plan:null,archived_specs:[{revision:1,summary:'Older',requirements:[],archived_at:'2026-01-01'}]};renderSpec();$('specContent').innerHTML", context) as string;
+  assert.match(saved, /Older/);
+  assert.match(saved, /data-reuse-spec="1"/);
 });
 
 test("notes Markdown checkbox switches from source text to escaped formatted content", () => {
@@ -341,9 +559,14 @@ test("control archive and delete manage memory, notes, spec and plan without cha
     const plans = new PlanService();
     await plans.create("planning", [{ kind: "investigation", title: "Inspect", objective: "Inspect state", covers: ["R1"],
       acceptance: [{ statement: "State inspected", covers: ["R1"] }], verification: [{ kind: "custom", program: "node", args: ["--version"] }] }]);
-    await assert.rejects(control.archivePlan("planning", memory.id, true), /Suspend or abandon/);
     await assert.rejects(control.archiveMemory("planning", memory.id, true), /Suspend or abandon/);
     await assert.rejects(control.deleteSpec("planning", memory.id), /Delete the associated plan/);
+    await controlRoute("POST", `/api/memories/${memory.id}/plan/archive`, q, { workspace: "planning" }, control);
+    assert.equal((await control.planStorage.read("planning", memory.id))?.status, "suspended");
+    assert.ok((await control.planDetail("planning", memory.id)).plan?.archived_at);
+    await assert.rejects(control.planTransition("planning", memory.id, "reactivate"), /Restore this archived plan/);
+    await controlRoute("POST", `/api/memories/${memory.id}/plan/restore`, q, { workspace: "planning" }, control);
+    await control.planTransition("planning", memory.id, "reactivate");
     await control.planTransition("planning", memory.id, "suspend");
     await controlRoute("POST", `/api/memories/${memory.id}/plan/archive`, q, { workspace: "planning" }, control);
     assert.ok((await control.planDetail("planning", memory.id)).plan?.archived_at);

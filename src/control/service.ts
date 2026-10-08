@@ -3,6 +3,10 @@ import { PlanStorage } from "../plan/storage.js";
 import { PlanService } from "../plan/service.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import type { TaskState } from "../task-state/schemas.js";
+import { structuredSpecSchema } from "../task-state/schemas.js";
+import { structuredSpecHash } from "../plan/binding.js";
+import { planStateSchema } from "../plan/schemas.js";
+import { atomicWrite } from "../shared/fs.js";
 
 export type MemoryFilters = { query?: string; status?: string; phase?: string; has_spec?: string; spec_archived?: string; unresolved?: string; modified?: string; sort?: string; archived?: string };
 export type PlanDecision = "suspend" | "abandon";
@@ -36,13 +40,14 @@ export class MemoryControlService {
       if (filters.status && filters.status !== "all" && state.status !== filters.status) continue;
       if (filters.phase && filters.phase !== "all" && state.phase !== filters.phase) continue;
       if (filters.has_spec === "yes" && !hasSpec || filters.has_spec === "no" && hasSpec) continue;
-      if (filters.spec_archived === "yes" && !state.spec_archived_at || filters.spec_archived === "no" && !!state.spec_archived_at) continue;
+      const archivedSpecs = spec ? await this.archivedSpecs(workspace, state.id, spec.revision) : [];
+      if (filters.spec_archived === "yes" && !state.spec_archived_at && !archivedSpecs.length || filters.spec_archived === "no" && (!hasSpec || !!state.spec_archived_at)) continue;
       if (filters.unresolved === "yes" && !unresolved || filters.unresolved === "no" && unresolved) continue;
       if (filters.modified === "day" && Date.now() - Date.parse(state.updated_at) > 86_400_000) continue;
       if (filters.modified === "week" && Date.now() - Date.parse(state.updated_at) > 7 * 86_400_000) continue;
       if (filters.modified === "month" && Date.now() - Date.parse(state.updated_at) > 30 * 86_400_000) continue;
       rows.push({ id: state.id, title: state.title, status: state.status, phase: state.phase, archived_at: state.archived_at,
-        spec_archived_at: state.spec_archived_at, updated_at: state.updated_at,
+        spec_archived_at: state.spec_archived_at || archivedSpecs[0]?.archived_at, updated_at: state.updated_at,
         has_spec: hasSpec, unresolved, record_count: state.records.length, plan_status: plan?.status });
     }
     if (filters.sort === "oldest") rows.sort((a, b) => a.updated_at.localeCompare(b.updated_at));
@@ -58,8 +63,20 @@ export class MemoryControlService {
     const plan = await this.planStorage.read(workspace, id);
     const revisions = [];
     for (let revision = 1; revision <= (memory.spec?.revision || 0); revision++) revisions.push(await this.tasks.storage.readSpecRevision(workspace, id, revision));
+    const archivedPlanEntries = await this.planStorage.historyEntries(workspace, id);
     return { memory, legacy_spec: legacyMarkdown && hasLegacySpec(legacyMarkdown) ? legacyMarkdown : undefined,
-      plan_status: plan?.status, plan: await this.plans.inspect(workspace, id), revisions };
+      plan_status: plan?.status, plan: await this.plans.inspect(workspace, id), revisions,
+      archived_specs: revisions.filter((item) => !!item.archived_at), archived_plans: archivedPlanEntries.map((item) => item.plan),
+      archived_plan_entries: archivedPlanEntries };
+  }
+
+  private async archivedSpecs(workspace: string, id: string, count: number) {
+    const archived = [];
+    for (let revision = 1; revision <= count; revision++) {
+      const spec = await this.tasks.storage.readSpecRevision(workspace, id, revision);
+      if (spec.archived_at) archived.push(spec);
+    }
+    return archived;
   }
 
   async create(workspace: string, phase = "investigation", requestedTitle?: string) {
@@ -118,13 +135,6 @@ export class MemoryControlService {
       if (!record) throw new Error(`Unknown note: ${recordId}`);
       memory.next_record_id ||= Math.max(0, ...memory.records.map((item) => Number(item.id.slice(1)) || 0)) + 1;
       memory.records = memory.records.filter((item) => item.id !== recordId);
-      if (!memory.records.some((item) => item.text === record.text)) {
-        memory.confirmed_findings = memory.confirmed_findings.filter((item) => item !== record.text);
-        memory.open_questions = memory.open_questions.filter((item) => item !== record.text);
-        memory.blockers = memory.blockers.filter((item) => item !== record.text);
-        memory.active_hypotheses = memory.active_hypotheses.filter((item) => item.text !== record.text);
-        memory.rejected_hypotheses = memory.rejected_hypotheses.filter((item) => item.text !== record.text);
-      }
       memory.updated_at = new Date().toISOString();
       await this.tasks.storage.transaction(workspace, id, "delete-memory-note", async () => {
         await this.tasks.storage.removeFinding(workspace, id, record);
@@ -138,12 +148,17 @@ export class MemoryControlService {
     await this.registry.get(workspace);
     return this.tasks.storage.workspaceLock(workspace, async () => {
       const memory = await this.tasks.storage.read(workspace, id);
-      if (!(await this.tasks.storage.readStructuredSpec(workspace, id)) && !hasLegacySpec(await this.tasks.storage.readSpec(workspace, id))) {
+      const spec = await this.tasks.storage.readStructuredSpec(workspace, id);
+      if (!spec && !hasLegacySpec(await this.tasks.storage.readSpec(workspace, id))) {
         throw new Error("No specification for this memory");
       }
+      if (archived && ["active", "final_review"].includes((await this.planStorage.read(workspace, id))?.status || "")) throw new Error("Suspend or abandon the plan before archiving its specification");
       if (archived) memory.spec_archived_at = new Date().toISOString(); else delete memory.spec_archived_at;
       memory.updated_at = new Date().toISOString();
-      await this.tasks.storage.write(workspace, memory);
+      await this.tasks.storage.transaction(workspace, id, "archive-specification", async () => {
+        if (spec) await this.tasks.storage.writeStructuredSpec(workspace, id, { ...spec, archived_at: memory.spec_archived_at });
+        await this.tasks.storage.write(workspace, memory);
+      }, spec ? [`spec_revision_${spec.revision}`] : []);
       return memory;
     });
   }
@@ -175,6 +190,77 @@ export class MemoryControlService {
     await this.tasks.storage.read(workspace, id);
     await this.plans.deleteForMemory(workspace, id);
     return { deleted: true };
+  }
+
+  async importFromMemory(workspace: string, targetId: string, sourceId: string, options: { notes: boolean; spec: boolean; plan: boolean; plan_archive_id?: string; spec_revision?: number }) {
+    await this.registry.get(workspace);
+    const reuseSaved = sourceId === targetId;
+    if (reuseSaved && (options.notes || !(options.plan && options.plan_archive_id || options.spec && !options.plan && options.spec_revision)))
+      throw new Error("Select a saved specification revision or plan to reuse in this memory");
+    if (!options.notes && !options.spec && !options.plan) throw new Error("Select notes, specification, or plan to import");
+    return this.tasks.storage.workspaceLock(workspace, async () => {
+      const source = await this.tasks.storage.read(workspace, sourceId);
+      const target = await this.tasks.storage.read(workspace, targetId);
+      if (target.archived_at || target.status === "completed") throw new Error("Import into a visible, unfinished memory");
+      if (options.plan_archive_id && !options.plan) throw new Error("Select plan import to choose an archived plan");
+      const sourcePlan = options.plan_archive_id
+        ? (await this.planStorage.historyEntries(workspace, sourceId)).find((entry) => entry.id === options.plan_archive_id)?.plan
+        : options.plan ? await this.planStorage.read(workspace, sourceId) : undefined;
+      if (options.plan && !sourcePlan) throw new Error("Source memory has no plan");
+      const needsSpec = options.spec || options.plan;
+      const targetSpec = needsSpec ? await this.tasks.storage.readStructuredSpec(workspace, targetId) : undefined;
+      if (needsSpec && targetSpec && !target.spec_archived_at && !reuseSaved) throw new Error("Destination already has a current specification; archive it first");
+      const targetPlan = needsSpec ? await this.planStorage.read(workspace, targetId) : undefined;
+      if (targetPlan && !targetPlan.archived_at) throw new Error("Destination already has a current plan; archive or delete it before importing a specification or plan");
+      const sourceSpec = sourcePlan?.spec_revision
+        ? await this.tasks.storage.readSpecRevision(workspace, sourceId, sourcePlan.spec_revision)
+        : needsSpec && options.spec_revision ? await this.tasks.storage.readSpecRevision(workspace, sourceId, options.spec_revision)
+          : needsSpec ? await this.tasks.storage.readStructuredSpec(workspace, sourceId) : undefined;
+      if (needsSpec && !sourceSpec) throw new Error("Source memory has no structured specification");
+      if (sourcePlan && (!sourcePlan.spec_revision || structuredSpecHash(sourceSpec!) !== sourcePlan.spec_hash))
+        throw new Error("Source plan has no matching structured specification");
+      if (options.notes && target.records.length + source.records.length > 500) throw new Error("Import exceeds the destination note limit");
+      const now = new Date().toISOString();
+      const nextRevision = sourceSpec ? (targetSpec?.revision || 0) + 1 : undefined;
+      const importedSpec = sourceSpec && nextRevision ? structuredSpecSchema.parse({ ...sourceSpec, revision: nextRevision,
+        reason: `Imported from memory ${sourceId}, specification revision ${sourceSpec.revision}`, created_at: now, archived_at: undefined }) : undefined;
+      const importedPlan = sourcePlan && importedSpec ? planStateSchema.parse({ ...sourcePlan, memory_id: targetId,
+        spec_hash: structuredSpecHash(importedSpec), spec_revision: importedSpec.revision, revision: 1, status: "suspended", current_step: 0,
+        steps: sourcePlan.steps.map((step, index) => ({ ...step, status: index === 0 ? "current" : "pending", mutation_generation: 0,
+          writes: step.writes.map((write) => ({ ...write, not_needed_reason: undefined })),
+          modified_paths: [], write_baseline: undefined, plan_baseline: undefined, check_receipts: undefined,
+          pending_mutation: undefined, pending_shell: undefined, violations: [],
+          verification: step.verification.map((item) => ({ ...item, verified_generation: undefined, last_exit: undefined, write_states: undefined })) })),
+        repository_baseline: undefined, revisions: [], lifecycle: [{ status: "suspended", reason: `Imported from memory ${sourceId}`, at: now }],
+        requirement_exceptions: [], marker_exceptions: [], final_evidence: undefined, review_receipt: undefined,
+        last_mutation_at: undefined, archived_at: undefined, archived_previous_status: undefined, suspended_from_final_review: undefined,
+        imported_from: { memory_id: sourceId, plan_revision: sourcePlan.revision }, created_at: now, updated_at: now }) : undefined;
+      let importedRecords: TaskState["records"] = [];
+      if (options.notes) {
+        let next = target.next_record_id || Math.max(0, ...target.records.map((item) => Number(item.id.slice(1)) || 0)) + 1;
+        importedRecords = source.records.map((record, index) => ({ ...record, id: `M${next++}`, status: "observed" as const,
+          evidence_refs: [], reason: `Imported from memory ${sourceId}, record ${record.id}`,
+          created_at: new Date(Date.parse(now) + index).toISOString(), updated_at: now,
+          archived_at: record.archived_at ? now : undefined }));
+        target.records = [...importedRecords, ...target.records]; target.next_record_id = next;
+      }
+      if (importedSpec) delete target.spec_archived_at;
+      target.updated_at = now;
+      if (importedPlan && targetPlan) await this.planStorage.archiveTerminal(workspace, targetPlan);
+      const archivePreviousSpec = reuseSaved && !!targetSpec && !targetSpec.archived_at;
+      await this.tasks.storage.transaction(workspace, targetId, "import-memory-content", async () => {
+        for (const record of importedRecords)
+          await this.tasks.storage.appendFinding(workspace, targetId, `## ${record.kind[0]!.toUpperCase()}${record.kind.slice(1)} — ${record.created_at}\n\n${record.text}`);
+        if (archivePreviousSpec) await this.tasks.storage.writeStructuredSpec(workspace, targetId, { ...targetSpec!, archived_at: now });
+        if (importedSpec) await this.tasks.storage.writeStructuredSpec(workspace, targetId, importedSpec);
+        if (importedPlan) await atomicWrite(this.planStorage.path(workspace, targetId), `${JSON.stringify(importedPlan, null, 2)}\n`);
+        await this.tasks.storage.write(workspace, target);
+      }, [
+        ...(importedSpec ? [`spec_revision_${importedSpec.revision}`] : []),
+        ...(archivePreviousSpec ? [`spec_revision_${targetSpec!.revision}`] : []),
+      ]);
+      return { imported_notes: options.notes ? source.records.length : 0, spec_revision: importedSpec?.revision, plan_status: importedPlan?.status };
+    });
   }
 
   private async settlePlan(workspace: string, memory: TaskState, decision?: PlanDecision) {
@@ -264,7 +350,8 @@ export class MemoryControlService {
         const now = new Date().toISOString();
         const summary = target.outcome?.summary || target.confirmed_findings.at(-1) || target.objective || target.title;
         const state: TaskState = { ...target, status: "completed", outcome: {
-          summary, limitations: target.blockers, evidence_refs: plan?.final_evidence?.verifications || [], completed_at: now }, updated_at: now };
+          summary, limitations: target.blockers, evidence_refs: [], modified_paths: plan?.final_evidence?.modified_paths || [],
+          verifications: plan?.final_evidence?.verifications || [], provenance_version: 2, completed_at: now }, updated_at: now };
         stateWriteAttempted = true;
         await this.tasks.storage.write(workspace, state); return state;
       } catch (error) {
@@ -284,6 +371,33 @@ export class MemoryControlService {
   async planTransition(workspace: string, id: string, action: "suspend" | "reactivate" | "abandon", reason?: string) {
     await this.registry.get(workspace);
     return this.plans.transitionForMemory(workspace, id, action === "reactivate" ? "active" : action === "suspend" ? "suspended" : "abandoned", reason);
+  }
+
+  async planSetStatus(workspace: string, id: string, status: "active" | "suspended" | "final_review" | "completed" | "abandoned", reason?: string) {
+    await this.registry.get(workspace);
+    return this.tasks.storage.workspaceLock(workspace, async () => {
+      await this.tasks.storage.read(workspace, id);
+      const plan = await this.planStorage.read(workspace, id);
+      if (!plan) throw new Error("No plan for this memory");
+      if (plan.status === status && !plan.archived_at) return plan;
+      const now = new Date().toISOString();
+      // This control-plane action records an operator choice, not a verified plan completion.
+      delete plan.review_receipt;
+      delete plan.final_evidence;
+      delete plan.archived_at;
+      delete plan.archived_previous_status;
+      delete plan.suspended_from_final_review;
+      if (status === "active" && plan.steps[plan.current_step]?.status !== "current") {
+        const next = plan.steps.findIndex((step) => step.status === "current" || step.status === "pending");
+        plan.current_step = next >= 0 ? next : plan.steps.length - 1;
+        plan.steps[plan.current_step]!.status = "current";
+      }
+      plan.status = status;
+      plan.updated_at = now;
+      plan.lifecycle = [...plan.lifecycle, { status, reason: reason?.trim() || "Operator changed plan status via UI", at: now }].slice(-50);
+      await this.planStorage.write(workspace, plan);
+      return plan;
+    });
   }
 
   async planFinish(workspace: string, id: string) {

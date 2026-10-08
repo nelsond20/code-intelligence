@@ -26,7 +26,7 @@ export class PlanGuard {
     const { plan, stale } = await this.plans.state(workspaceId);
     if (!plan || ["completed", "abandoned"].includes(plan.status)) {
       const memory = await this.plans.tasks.current(workspaceId);
-      if (memory && await this.plans.storage.tasks.readStructuredSpec(workspaceId, memory.id))
+      if (memory && !memory.spec_archived_at && await this.plans.storage.tasks.readStructuredSpec(workspaceId, memory.id))
         return { allowed: false, kind: "mutation", reason: "PLAN_REQUIRED: Create the persistent Code Intelligence plan before modifying workspace files." };
       return { allowed: true, kind: "mutation" };
     }
@@ -41,6 +41,13 @@ export class PlanGuard {
       const identified = await Promise.all(targets.map((target) => this.identify(workspaceId, target)));
       const denied = identified.find((item) => !allowed.has(`${item.repo}:${item.path}`));
       if (denied) return { allowed: false, kind: "mutation", reason: `Current step does not authorize ${denied.repo}:${denied.path}` };
+      const pending = plan.steps[plan.current_step]!;
+      if (pending.pending_shell) return { allowed: false, kind: "mutation", reason: "Previous tool effects have not been verified" };
+      if (pending.pending_mutation) {
+        const prior = new Set(pending.pending_mutation.targets.map((item) => `${item.repo}:${item.path}`));
+        if (identified.every((item) => prior.has(`${item.repo}:${item.path}`))) return { allowed: true, kind: "mutation" };
+        return { allowed: false, kind: "mutation", reason: "Previous tool effects have not been verified" };
+      }
       await this.plans.captureMutation(workspaceId, identified);
       return { allowed: true, kind: "mutation" };
     } catch (error) { return { allowed: false, kind: "mutation", reason: (error as Error).message }; }
@@ -51,8 +58,10 @@ export class PlanGuard {
     const { plan, stale } = await this.plans.state(workspaceId);
     if (!plan || ["completed", "abandoned"].includes(plan.status)) {
       const memory = await this.plans.tasks.current(workspaceId);
-      if (mutation.test(command) && memory && await this.plans.storage.tasks.readStructuredSpec(workspaceId, memory.id))
-        return { allowed: false, kind: "mutation", reason: "PLAN_REQUIRED: Create the persistent Code Intelligence plan before modifying workspace files." };
+      // Shell commands can mutate through scripts, child processes, and tools whose
+      // names do not reveal their effects. There is no read-only shell sandbox here.
+      if (memory && !memory.spec_archived_at && await this.plans.storage.tasks.readStructuredSpec(workspaceId, memory.id))
+        return { allowed: false, kind: "mutation", reason: "PLAN_REQUIRED: Create the persistent Code Intelligence plan before running workspace shell commands." };
       return { allowed: true, kind: "other" };
     }
     if (plan.status === "suspended") return { allowed: false, kind: "other", reason: "The current memory has a suspended plan; reactivate or abandon it before executing commands" };
@@ -65,6 +74,7 @@ export class PlanGuard {
     if (mutation.test(command)) return { allowed: false, kind: "mutation", reason: stale
       ? "Active plan is stale because the confirmed spec changed"
       : "Detectable shell-based file mutation is blocked while a guarded plan is active" };
+    if (step.pending_shell || step.pending_mutation) return { allowed: false, kind: "other", reason: "Previous tool effects have not been verified" };
     if (stale) return { allowed: false, kind: "other", reason: "Active plan is stale because the confirmed spec changed" };
     await this.plans.captureShell(workspaceId);
     if (step.verification.some((item) => verificationCommand(item) === command.trim())) return { allowed: true, kind: "verification" };
