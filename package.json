@@ -1,6 +1,6 @@
 {
   "name": "code-intelligence",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Local code retrieval, persistent work memory, and guarded execution plans for OpenCode",
   "type": "module",
   "private": true,
@@ -12,7 +12,7 @@
     "integrations",
     "README.md",
     "SECURITY.md",
-    "PRIVACY.md",
+    "docs",
     "LICENSE"
   ],
   "scripts": {
@@ -21,14 +21,23 @@
     "test": "npm run build && node --test dist/tests/*.test.js",
     "test:coverage": "npm run build && node --test --experimental-test-coverage dist/tests/*.test.js",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/cli/main.js"
+    "start": "node dist/src/cli/main.js",
+    "benchmark:prepare": "npm run build && node dist/scripts/benchmark.js prepare",
+    "benchmark:evaluate": "npm run build && node dist/scripts/benchmark.js evaluate",
+    "model-facing:prepare": "npm run build && node dist/scripts/model-facing-eval.js prepare",
+    "model-facing:evaluate": "npm run build && node dist/scripts/model-facing-eval.js evaluate",
+    "model-facing:schema-diagnostic": "npm run build && node dist/scripts/model-facing-schema-diagnostic.js",
+    "memory-control:prepare": "npm run build && node dist/scripts/memory-control-eval.js prepare",
+    "memory-control:evaluate": "npm run build && node dist/scripts/memory-control-eval.js evaluate"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
+    "@ast-grep/napi": "^0.45.3",
     "@modelcontextprotocol/sdk": "^1.26.0",
     "jsonc-parser": "^3.3.1",
+    "zod-to-json-schema": "^3.25.1",
     "zod": "^3.25.76"
   },
   "devDependencies": {

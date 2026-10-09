@@ -6,7 +6,7 @@ export class ContextBroker {
   constructor(private readonly backends: ContextBackend[]) {}
   async find(request: FindRequest) {
     const limit = Math.max(1, Math.min(20, request.limit || 8));
-    const gitRelevant = /\b(commit|history|historical|introduced|changed|change|when did|who changed|blame|regression|previous|before|after|diff)\b/i.test(request.query);
+    const gitRelevant = /\b(commit|history|historical|introduced|changed|change|when did|who changed|blame|regression|previous|before|after|diff|historial|histórico|introdujo|cambió|cambio|cuándo|quién|regresión|anterior|antes|después|diferencia)\b/i.test(request.query);
     const defaults = this.backends.map((backend) => backend.source).filter((source) => source !== "git" || gitRelevant);
     const requested = new Set<ContextSource>(request.sources?.length ? request.sources : defaults);
     const selected = this.backends.filter((backend) => requested.has(backend.source));
@@ -23,8 +23,13 @@ export class ContextBroker {
       });
     });
     const results = [...fused.values()].sort((a, b) => b.rankScore - a.rankScore || a.item.ref.localeCompare(b.item.ref)).slice(0, limit)
-      .map(({ item }) => ({ ...item, snippet: item.snippet.slice(0, 1000) }));
-    return { results, unavailable_sources: failures, truncated: fused.size > limit };
+      .map(({ item }) => ({ ...item, snippet: item.snippet.slice(0, 1000), available_views: item.available_views || (item.source === "docs" ? ["content"]
+        : item.source === "vault" ? ["content"] : item.source === "git" ? ["summary", "diff", "file", "impact", "blame"] : ["content", "surrounding"]) }));
+    const suggested = [...new Set(results.flatMap((item) => {
+      const metadata = item.metadata || {}; return [metadata.symbol, metadata.path].filter((value): value is string => typeof value === "string" && value.length > 0);
+    }))].slice(0, 5);
+    return { results, unavailable_sources: failures, diagnostics: failures.length ? { degraded_sources: failures } : {},
+      suggested_queries: suggested, truncated: fused.size > limit };
   }
   async inspect(request: InspectRequest) {
     const parsed = parseContextRef(request.ref); const backend = this.backends.find((candidate) => candidate.source === parsed.source);

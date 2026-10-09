@@ -5,7 +5,7 @@ export const managedAgentsBlock = `<!-- CODE_INTELLIGENCE_BEGIN -->
 - **INSPECT:** Use \`context.inspect\` for exact content, surroundings, references, or relations from a discovered ref.
 - Refs are opaque broker handles. Pass them exactly as returned by \`context.find\`; never decode, reconstruct, edit, or guess them. Ephemeral refs may require repeating \`context.find\` after restart or eviction.
 - **MEMORY:** Use \`memory\` as persistent work memory. Call \`memory current\` when resuming substantial work. Record durable observations, evidence, hypotheses, decisions, questions, blockers, and relevant context early. The confirmed spec belongs to memory.
-- **PLAN:** When an active plan exists, call \`plan current\` to learn the server-owned current step. Do not work ahead or modify paths outside that step. Request \`plan complete\` only after required verification. Use \`plan revise\` with a reason instead of silently deviating.
+- **PLAN:** After setting the complete structured spec, create a small plan with title, objective, and optional write paths; call \`plan current\` before mutations. Work only the server-owned current step. Call \`plan complete_current\` to run configured checks or \`plan revise_current\` with a reason. After all steps, invoke \`code-review-and-quality\` for the cumulative change; the operator controls final completion.
 - The MCP workspace is configured by the host. Never pass or guess a workspace ID. Use \`scope\` only to restrict Code/Git discovery to a repository inside that workspace; Docs and Vault ignore it.
 - For change review, use read-only Git or broker Git inspection to determine what changed, then \`context.find\`/\`context.inspect\` to determine impact. Prefer summary/file views over large diffs.
 - Context inspection may record inspected refs, files, symbols, and commits mechanically. Use \`memory\` notes for semantic findings, hypotheses, decisions, and conclusions.
@@ -105,6 +105,15 @@ const shellCommand = (event) => typeof event.input?.command === "string" ? event
 const exitCode = (event) => event.result?.metadata?.exitCode ?? event.result?.metadata?.exit_code ?? event.result?.metadata?.exitStatus?.exitCode ??
   (event.result?.output?.ok === true ? 0 : event.result?.output?.ok === false ? 1 : undefined)
 
+const recordHeartbeat = (directory) => {
+  try {
+    const heartbeat = spawn("code-intelligence", ["integration", "heartbeat", "--workspace", "__CODE_INTELLIGENCE_WORKSPACE__"], {
+      cwd: directory, shell: false, stdio: "ignore", env: { ...process.env, NO_COLOR: "1" },
+    })
+    heartbeat.unref()
+  } catch { /* doctor will report a degraded guard */ }
+}
+
 export default {
   id: "code-intelligence",
 
@@ -132,8 +141,10 @@ export default {
       registrations.push(await ctx.tool.hook("execute.before", async (event) => {
         if (["edit", "write", "patch"].includes(event.tool)) {
           await runGuard(ctx.location.directory, "guard-before", { kind: "mutation", targets: mutationTargets(event) })
+          recordHeartbeat(ctx.location.directory)
         } else if (event.tool === "execute") {
           await runGuard(ctx.location.directory, "guard-before", { kind: "shell", command: shellCommand(event) })
+          recordHeartbeat(ctx.location.directory)
         }
       }))
       registrations.push(await ctx.tool.hook("execute.after", async (event) => {
@@ -141,7 +152,7 @@ export default {
         if (["edit", "write", "patch"].includes(event.tool)) {
           await runGuard(ctx.location.directory, "guard-after", { kind: "mutation", targets: mutationTargets(event) })
         } else if (event.tool === "execute" && Number.isInteger(exitCode(event))) {
-          await runGuard(ctx.location.directory, "guard-after", { kind: "verification", command: shellCommand(event), exit_code: exitCode(event) })
+          await runGuard(ctx.location.directory, "guard-after", { kind: "shell", command: shellCommand(event), exit_code: exitCode(event) })
         }
       }))
 

@@ -4,3 +4,10 @@ coverage/
 *.log
 .DS_Store
 tests/.runtime/
+benchmarks/.runtime/
+benchmarks/.model-facing/
+benchmarks/.memory-control-v1/
+docs/logs/qwen-memory-initial-tools.json
+docs/logs/qwen-memory-user-turn-tools.json
+docs/logs/qwen-memory-visible-tools.json
+docs/logs/qwen-memory-compat-tools.json

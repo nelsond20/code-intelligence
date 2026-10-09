@@ -71,7 +71,7 @@ export function splitEmbeddingChunk(chunk: SourceChunk, budget: number): SourceC
       if (substantial.length > 0) end = substantial.at(-1)!;
     }
     const text = lines.slice(start, end).join("\n");
-    output.push({ start_line: chunk.start_line + start, end_line: chunk.start_line + end - 1, text });
+    output.push({ start_line: chunk.start_line + start, end_line: chunk.start_line + end - 1, text, symbol: chunk.symbol, signature: chunk.signature });
     start = end;
   }
   return output;

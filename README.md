@@ -1,10 +1,14 @@
 # Code Intelligence
 
+La documentación formal de la versión 0.3.0 empieza en
+[docs/README.md](docs/README.md). Incluye guía completa, referencia MCP,
+configuración, operación, limitaciones, benchmark y handoff.
+
 Code Intelligence is a local **Context Broker + Persistent Work Memory + Guarded Plan** for OpenCode and local models. It keeps durable work context across sessions and compactions, retrieves small relevant slices from multiple repositories, and presents exactly four MCP tools:
 
 - `context.find` discovers code, local documentation, vault knowledge, and Git history.
 - `context.inspect` deepens an opaque broker reference with bounded content, surroundings, relationships, commit summaries, diffs, or blame.
-- `memory` manages persistent semantic work memory and the confirmed specification.
+- `memory` reads the operator-selected active memory and manages its notes and structured specification.
 - `plan` controls an optional spec-bound ordered execution plan.
 
 The default configuration sends no source, prompts, queries, embeddings, analytics, or telemetry to remote services.
@@ -152,12 +156,14 @@ For Ornith, use context `90112` and output `8192`. This project does not change 
 
 ## Typical workflow
 
-For substantial work, call `memory` with `action: "new"`, then use `context.find` and `context.inspect`. Record durable meaning—evidence, hypotheses, decisions, questions, and blockers—with `memory(action="note")`. Store confirmed outcome requirements in memory's spec. For guarded work, create a plan derived from that spec, call `plan(action="current")`, work only in the current step, verify it, and request `plan(action="complete")`. Use `plan(action="revise")` instead of silently deviating.
+For substantial work, use `code-intelligence ui` to create and select the active memory. The agent can call `memory(action="current")`, record durable meaning with `memory(action="note")`, resolve records by server ID, and declare the complete desired structured specification with `memory(action="spec_set")`. For guarded work, create a coverage-checked plan, call `plan(action="current")`, work only in the current write set, verify it, and request `plan(action="complete_current")`. Use `plan(action="revise_current")` for the current step. The localhost UI owns suspend/reactivate/abandon and final completion requires a cumulative `code-review-and-quality` receipt; Qwen 0.24.7 currently exposes no verifiable review result, so the gate remains hard.
+
+The UI also provides Archive, Restore, and Delete for memories, notes, specifications, and plans. Archive hides an item in the default UI view and can be reversed; deleting removes its stored data. The [user guide](docs/product/USER_GUIDE.md) explains the dependencies and restore views.
 
 Memory lifecycle from the CLI:
 
 ```bash
-code-intelligence memory new "Planning duration correction" --workspace planning --objective "Correct duration behavior"
+code-intelligence ui
 code-intelligence memory current --workspace planning
 code-intelligence memory pause --workspace planning
 code-intelligence memory activate planning-duration-correction --workspace planning
@@ -165,7 +171,12 @@ code-intelligence memory complete --workspace planning
 code-intelligence plan current --workspace planning
 ```
 
-Each work item stores `state.json`, `findings.md`, and `spec.md`, with optional execution state in `plan.json`. The old `task` CLI namespace remains a deprecated compatibility alias; there is no public MCP `task` tool.
+Each work item stores schema-v2 `state.json`, curated `findings.md`, structured `spec.json`, immutable spec revisions, a human `spec.md`, a transaction journal, and optional `plan.json`. The old `task` CLI namespace remains a deprecated compatibility alias; there is no public MCP `task` tool.
+
+The control plane binds to `127.0.0.1:4317` by default. Its search and filters
+cover saved memories across workspaces; the agent sees only the selected active
+memory in its configured workspace. A workspace can intentionally have no
+active memory.
 
 ## Git behavior
 
@@ -187,9 +198,14 @@ npm test
 npm run typecheck
 npm run lint
 npm run build
+npm run benchmark:prepare
 ```
 
 Tests cover memory and plan restart, spec staleness, verification generations, PlanGuard interception, broker fail-open behavior, path/symlink boundaries, secret exclusion, Git safety, installer idempotence, privacy policy, and the exact four-tool MCP surface.
+
+The model benchmark is documented in [docs/operations/BENCHMARK.md](docs/operations/BENCHMARK.md).
+Preparation creates isolated local fixtures but never invokes a model; endpoint
+access must be authorized separately.
 
 ## Uninstall OpenCode integration
 
