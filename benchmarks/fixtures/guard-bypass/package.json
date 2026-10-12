@@ -1,0 +1,1 @@
+{"type":"module","scripts":{"test":"node mutating-check.mjs && node --test"}}

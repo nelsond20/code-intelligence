@@ -22,6 +22,6 @@ The default `loopback-only` policy accepts only literal `127.0.0.0/8` and `::1` 
 
 ## Persistence and concurrency
 
-Memory and plan files use restrictive directories/files, atomic rename writes, schema validation, and per-workspace/file locks. `plan.json` contains bounded execution state, not prompts, source chunks, Docs/Vault payloads, credentials, or reasoning. OpenCode PlanGuard uses verified `execute.before`/`execute.after` hooks to reject out-of-step editor targets and detectable shell/code mutation bypasses while a plan is active. Installer edits are previewable, idempotent, backed up, comment-preserving, and limited to owned entries/markers.
+Memory and plan files use restrictive directories/files, atomic rename writes, schema validation, per-workspace/file locks, last-valid backups, and a recoverable transaction journal for related state/spec/findings changes. `plan.json` contains bounded execution state, not prompts, source chunks, Docs/Vault payloads, credentials, or reasoning. OpenCode PlanGuard uses verified `execute.before`/`execute.after` hooks, real pre/post content manifests, and a functional heartbeat to reject out-of-step editor targets and indirect shell mutation bypasses while a plan is active. Installer edits are previewable, idempotent, backed up, comment-preserving, and limited to owned entries/markers.
 
 Report suspected vulnerabilities without including repository source, prompts, credentials, or memory/plan contents in public issues.

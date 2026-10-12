@@ -1,6 +1,6 @@
 import path from "node:path";
 
-const DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", "vendor", ".next", ".cache", "target", "__pycache__"]);
+const DIRS = new Set([".git", ".ci-runtime", "node_modules", "dist", "build", "coverage", "vendor", ".next", ".cache", "target", "__pycache__"]);
 const SECRET_PATTERNS = [
   /^\.env($|\.)/i, /\.pem$/i, /\.key$/i, /^id_rsa/i, /^id_ed25519/i,
   /^credentials($|\.)/i, /^secrets?($|\.)/i, /\.p12$/i, /\.pfx$/i,
@@ -18,7 +18,7 @@ export function isGloballyIgnored(relativePath: string): boolean {
 
 export function defaultRgGlobs(): string[] {
   return [
-    "!.git/**", "!node_modules/**", "!dist/**", "!build/**", "!coverage/**", "!vendor/**",
+    "!.git/**", "!**/.ci-runtime/**", "!node_modules/**", "!dist/**", "!build/**", "!coverage/**", "!vendor/**",
     "!.next/**", "!.cache/**", "!**/.env*", "!**/*.pem", "!**/*.key", "!**/id_rsa*",
     "!**/id_ed25519*", "!**/credentials*", "!**/secrets*",
   ];

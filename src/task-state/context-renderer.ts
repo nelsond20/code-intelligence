@@ -1,8 +1,10 @@
 import type { TaskState } from "./schemas.js";
+import { projectTaskState } from "./projection.js";
 
 function compactList(values: string[], max = 12): string[] { return values.slice(0, max); }
 
 export function taskBootstrap(state: TaskState, findingsPath: string, specPath: string) {
+  state = projectTaskState(state);
   return {
     id: state.id,
     title: state.title,
@@ -10,6 +12,7 @@ export function taskBootstrap(state: TaskState, findingsPath: string, specPath: 
     objective: state.objective,
     phase: state.phase,
     confirmed_findings: compactList(state.confirmed_findings),
+    supported_findings: compactList(state.supported_findings),
     active_hypotheses: state.active_hypotheses.slice(0, 10),
     open_questions: compactList(state.open_questions),
     blockers: compactList(state.blockers),
@@ -18,7 +21,7 @@ export function taskBootstrap(state: TaskState, findingsPath: string, specPath: 
     inspected_refs: compactList(state.inspected_refs, 15),
     inspected_commits: state.inspected_commits.slice(0, 10),
     findings_path: findingsPath,
-    spec_path: specPath,
+    spec_path: state.spec_archived_at ? undefined : specPath,
     updated_at: state.updated_at,
   };
 }
@@ -26,22 +29,28 @@ export function taskBootstrap(state: TaskState, findingsPath: string, specPath: 
 export function renderTaskContext(state: TaskState, findingsPath: string, specPath: string, maxTokens = 3000): string {
   const maxChars = Math.max(400, maxTokens * 4);
   const bootstrap = taskBootstrap(state, findingsPath, specPath);
-  let text = [
-    "## MEMORY",
+  const required = ["## MEMORY",
     `Work: ${bootstrap.title} (${bootstrap.id}, ${bootstrap.status})`,
     `Objective: ${bootstrap.objective || "Not set"}`,
     `Phase: ${bootstrap.phase}`,
-    bootstrap.confirmed_findings.length ? `Confirmed findings:\n${bootstrap.confirmed_findings.map((v) => `- ${v}`).join("\n")}` : "",
-    bootstrap.active_hypotheses.length ? `Active hypotheses:\n${bootstrap.active_hypotheses.map((v) => `- [${v.confidence}] ${v.text}`).join("\n")}` : "",
-    bootstrap.open_questions.length ? `Open questions:\n${bootstrap.open_questions.map((v) => `- ${v}`).join("\n")}` : "",
-    bootstrap.blockers.length ? `Blockers:\n${bootstrap.blockers.map((v) => `- ${v}`).join("\n")}` : "",
-    bootstrap.relevant_files.length ? `Relevant files:\n${bootstrap.relevant_files.map((v) => `- ${v.repo}:${v.path}`).join("\n")}` : "",
-    bootstrap.relevant_symbols.length ? `Relevant symbols: ${bootstrap.relevant_symbols.join(", ")}` : "",
-    bootstrap.inspected_commits.length ? `Recently inspected commits: ${bootstrap.inspected_commits.map((v) => `${v.repo}:${v.commit}`).join(", ")}` : "",
-    bootstrap.inspected_refs.length ? `Recently inspected refs: ${bootstrap.inspected_refs.join(", ")}` : "",
-    `Detailed findings: ${findingsPath}`,
-    `Confirmed spec: ${specPath}`,
-  ].filter(Boolean).join("\n\n");
-  if (text.length > maxChars) text = `${text.slice(0, maxChars - 34)}\n… [memory context truncated]`;
-  return text;
+    "For full records and the structured spec, call memory.current on the operator-selected active memory.",
+  ];
+  const optional = [
+    ...bootstrap.blockers.map((v) => `Blocker: ${v}`),
+    ...bootstrap.open_questions.map((v) => `Open question: ${v}`),
+    ...bootstrap.confirmed_findings.map((v) => `Confirmed: ${v}`),
+    ...bootstrap.supported_findings.map((v) => `Supported: ${v}`),
+    ...bootstrap.active_hypotheses.map((v) => `Hypothesis [${v.confidence}]: ${v.text}`),
+    ...bootstrap.relevant_files.map((v) => `Relevant file: ${v.repo}:${v.path}`),
+    ...bootstrap.relevant_symbols.map((v) => `Relevant symbol: ${v}`),
+    ...bootstrap.inspected_commits.map((v) => `Inspected commit: ${v.repo}:${v.commit}`),
+    ...bootstrap.inspected_refs.map((v) => `Inspected ref: ${v}`),
+  ];
+  const sections = [...required]; let truncated = false;
+  for (const item of optional) {
+    if ([...sections, item].join("\n\n").length > maxChars - 40) { truncated = true; break; }
+    sections.push(item);
+  }
+  if (truncated) sections.push("… [additional memory items omitted]");
+  return sections.join("\n\n");
 }

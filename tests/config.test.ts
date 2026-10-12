@@ -35,6 +35,14 @@ test("external source timeouts have safe defaults and round-trip independently",
   assert.throws(() => parseConfigToml(serializeConfigToml(config).replace("timeout_ms = 44444", "timeout_ms = 99")), /greater than or equal to 100/);
 });
 
+test("workspace verification policy round-trips and defaults to no required checks", () => {
+  const config = defaultConfig();
+  config.workspaces.push({ id: "app", name: "App", repositories: [{ id: "repo", path: "/repo" }], verification: ["lint", "build"] });
+  const parsed = parseConfigToml(serializeConfigToml(config));
+  assert.deepEqual(parsed.workspaces[0]?.verification, ["lint", "build"]);
+  assert.deepEqual(parseConfigToml('[[workspaces]]\nid = "old"\nname = "Old"\n').workspaces[0]?.verification, []);
+});
+
 test("semantic requests use the configured embedding timeout", async () => {
   const config = defaultConfig(); config.embeddings.timeout_ms = 100;
   let receivedSignal: AbortSignal | undefined;
@@ -169,4 +177,19 @@ test("HTTP MCP configuration round-trips and enforces loopback-only URLs", () =>
 test("Local Docs accepts an explicitly configured inspect tool for backward-compatible configuration", () => {
   const config = defaultConfig(); config.local_docs.inspect_tool = "legacy.read";
   assert.equal(parseConfigToml(serializeConfigToml(config)).local_docs.inspect_tool, "legacy.read");
+});
+
+test("version 2 sources round-trip while version 1 remains readable", () => {
+  const config = defaultConfig();
+  config.schema_version = 2;
+  config.sources = [{ id: "manuales-equipo", enabled: true, transport: "stdio", command: "manuales-ci-adapter",
+    args: ["--local"], timeout_ms: 7_000, search_tool: "search", inspect_tool: "inspect" }];
+  const parsed = parseConfigToml(serializeConfigToml(config));
+  assert.deepEqual(parsed.sources, config.sources);
+  assert.equal(parseConfigToml("schema_version = 1\n[local_docs]\nenabled = true\n").local_docs.enabled, true);
+  assert.throws(() => parseConfigToml(serializeConfigToml(config).replace('id = "manuales-equipo"', 'id = "code"')), /reserved/);
+  assert.throws(() => parseConfigToml(`${serializeConfigToml(config)}\n[[sources]]\nid = "manuales-equipo"\ncommand = "other"\n`), /duplicate/);
+  assert.throws(() => parseConfigToml(`${serializeConfigToml(config)}\n[unexpected]\nvalue = "lost"\n`), /Unknown configuration field/);
+  assert.throws(() => parseConfigToml(serializeConfigToml(config).replace('transport = "stdio"\ncommand = "manuales-ci-adapter"',
+    'transport = "http"\nurl = "https://example.com/mcp"')), /not loopback/);
 });

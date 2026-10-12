@@ -1,12 +1,10 @@
 import { readFile } from "node:fs/promises";
 import type { Repository } from "../config/schema.js";
-import { isGloballyIgnored } from "../privacy/ignores.js";
-import { resolveInside, truncateUtf8 } from "../shared/fs.js";
+import { RepositoryAccessPolicy } from "../privacy/repository-access.js";
+import { truncateUtf8 } from "../shared/fs.js";
 
 export async function readCode(repository: Repository, requestedPath: string, startLine = 1, endLine?: number, maxLines = 400, maxBytes = 16_000) {
-  if (isGloballyIgnored(requestedPath)) throw new Error("Path is excluded by the security ignore policy");
-  const resolved = await resolveInside(repository.path, requestedPath);
-  if (isGloballyIgnored(resolved.relative)) throw new Error("Path is excluded by the security ignore policy");
+  const resolved = await (await RepositoryAccessPolicy.create(repository.path)).resolveFile(requestedPath);
   const lines = (await readFile(resolved.absolute, "utf8")).split(/\r?\n/);
   const start = Math.max(1, Math.trunc(startLine));
   const requestedEnd = endLine === undefined ? start + Math.min(200, maxLines) - 1 : Math.trunc(endLine);

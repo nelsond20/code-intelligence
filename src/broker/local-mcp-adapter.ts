@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { z } from "zod";
 // @ts-ignore -- declared runtime dependency; allows offline validation before npm installs the SDK.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 // @ts-ignore -- declared runtime dependency; allows offline validation before npm installs the SDK.
@@ -8,13 +9,15 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { sanitizedChildEnv } from "../privacy/child-env.js";
 import { assertEndpointAllowed } from "../privacy/network-policy.js";
 import { truncateUtf8 } from "../shared/fs.js";
-import { docsRef, parseContextRef, vaultRef } from "./refs.js";
-import type { ContextBackend, ContextReference, FindRequest, InspectRequest } from "./types.js";
+import { docsRef, parseContextRef, sourceRef, vaultRef } from "./refs.js";
+import type { ContextBackend, ContextReference, FindRequest, InspectRequest, InspectView } from "./types.js";
 
 export interface LocalAdapterConfig {
-  source: "docs" | "vault";
+  source: string;
+  profile?: "docs" | "vault" | "normalized";
   transport: "stdio" | "http";
   command: string;
+  args?: string[];
   url: string;
   tokenFile?: string;
   networkPolicy: "loopback-only" | "unrestricted";
@@ -90,6 +93,24 @@ function structuredOrJsonText(result: unknown, label: string): unknown {
   catch { throw new Error(`${label} returned malformed JSON`); }
 }
 
+const vistaSchema = z.enum(["content", "surrounding", "relations", "references", "summary", "diff", "file", "impact", "blame"]);
+const resultadoSchema = z.object({
+  schema_version: z.literal(1),
+  results: z.array(z.object({
+    id: z.string().min(1).max(2_000), title: z.string().min(1).max(5_000), snippet: z.string().max(16_000),
+    score: z.number().finite(), metadata: z.record(z.string(), z.unknown()).default({}),
+    views: z.array(vistaSchema).min(1).max(9).default(["content"]),
+  })).max(20),
+});
+const inspeccionSchema = z.object({
+  schema_version: z.literal(1), content: z.string(), metadata: z.record(z.string(), z.unknown()).default({}),
+});
+
+function metadataAcotada(metadata: Record<string, unknown>): Record<string, unknown> {
+  if (Buffer.byteLength(JSON.stringify(metadata), "utf8") > 8_000) throw new Error("Source metadata exceeds 8000 bytes");
+  return metadata;
+}
+
 function vaultHits(result: unknown): Array<{ path: string; score: number }> {
   const payload = structuredOrJsonText(result, "Vault search");
   if (!payload || typeof payload !== "object" || !Array.isArray((payload as { hits?: unknown }).hits)) {
@@ -144,9 +165,10 @@ function safeError(error: unknown, secret?: string): Error {
 }
 
 export class LocalMcpAdapter implements ContextBackend {
-  readonly source: "docs" | "vault";
+  readonly source: string;
   private readonly docsCache: DocsResultCache;
   private readonly vaultRefs: VaultRefCache;
+  private readonly vistasPorRef = new Map<string, InspectView[]>();
   constructor(private readonly options: LocalAdapterConfig) {
     this.source = options.source; this.docsCache = options.docsCache || new DocsResultCache();
     this.vaultRefs = options.vaultRefs || new VaultRefCache();
@@ -173,12 +195,12 @@ export class LocalMcpAdapter implements ContextBackend {
     }
     const rawEnv = sanitizedChildEnv("serena");
     const env = Object.fromEntries(Object.entries(rawEnv).filter((entry): entry is [string, string] => entry[1] !== undefined));
-    return { token: undefined, transport: new StdioClientTransport({ command: this.options.command, args: [], env }) };
+    return { token: undefined, transport: new StdioClientTransport({ command: this.options.command, args: this.options.args || [], env }) };
   }
 
   private async session<T>(action: (client: Client, tools: string[], token?: string) => Promise<T>): Promise<T> {
     let token: string | undefined;
-    const client = new Client({ name: "code-intelligence-broker", version: "0.1.0" });
+    const client = new Client({ name: "code-intelligence-broker", version: "0.3.0" });
     try {
       const created = await this.transport(); token = created.token;
       await deadline(client.connect(created.transport), this.timeout(3_000), `${this.source} connection`);
@@ -206,6 +228,7 @@ export class LocalMcpAdapter implements ContextBackend {
   private async call(tool: string, args: Record<string, unknown>): Promise<unknown> {
     return this.session(async (client, _tools, token) => {
       const result = await deadline(client.callTool({ name: tool, arguments: args }), this.timeout(), `${this.source} retrieval`);
+      if (result.isError) throw new Error(`${this.source} MCP tool ${tool} failed`);
       return redactValue(result, token);
     });
   }
@@ -213,7 +236,20 @@ export class LocalMcpAdapter implements ContextBackend {
   async find(request: FindRequest): Promise<ContextReference[]> {
     const limit = Math.max(1, Math.min(20, request.limit || 8));
     const result = await this.call(this.options.searchTool, { query: request.query, limit });
-    if (this.source === "vault") {
+    const profile = this.options.profile || (this.source === "docs" || this.source === "vault" ? this.source : "normalized");
+    if (profile === "normalized") {
+      const payload = resultadoSchema.parse(structuredOrJsonText(result, `${this.source} search`));
+      return payload.results.slice(0, limit).map((item) => {
+        const ref = sourceRef(this.source, item.id);
+        this.vistasPorRef.delete(ref);
+        this.vistasPorRef.set(ref, item.views as InspectView[]);
+        if (this.vistasPorRef.size > 256) this.vistasPorRef.delete(this.vistasPorRef.keys().next().value!);
+        return { ref, source: this.source, title: item.title.slice(0, 500),
+          snippet: item.snippet.slice(0, 1_000), score: item.score, metadata: metadataAcotada(item.metadata),
+          available_views: item.views as InspectView[], reason: `${this.source} retrieval` };
+      });
+    }
+    if (profile === "vault") {
       return vaultHits(result).slice(0, limit).map((hit) => ({
         ref: this.vaultRefs.create(hit.path), source: "vault", title: hit.path, snippet: "", score: hit.score,
         reason: "vault local retrieval",
@@ -229,7 +265,7 @@ export class LocalMcpAdapter implements ContextBackend {
       const row = raw as Record<string, unknown>;
       const field = (name: string, max = 1_000) => typeof row[name] === "string" ? (row[name] as string).slice(0, max) : "";
       const explicitIdentity = field("ref", 2_000) || field("id", 2_000) || field("path", 2_000) || field("uri", 2_000);
-      if (this.source === "docs") {
+      if (profile === "docs") {
         const metadata = { framework: field("framework", 200), version: field("version", 200), source: field("source", 2_000),
           heading: field("heading", 1_000), commit: field("commit", 200) };
         const fullContent = field("content", 1_000_000) || field("text", 1_000_000) || field("snippet", 1_000_000);
@@ -249,7 +285,19 @@ export class LocalMcpAdapter implements ContextBackend {
     const parsed = parseContextRef(request.ref);
     if (parsed.source !== this.source || !parsed.identity) throw new Error(`Not a ${this.source} reference`);
     const view = request.view || "content";
-    if (this.source === "docs") {
+    const profile = this.options.profile || (this.source === "docs" || this.source === "vault" ? this.source : "normalized");
+    if (profile === "normalized") {
+      if (!request.ref.startsWith("ci-source://")) throw new Error("Legacy source reference is not valid for this configured source; repeat context.find");
+      if (!this.options.inspectTool) throw new Error(`${this.source} inspection is not configured`);
+      const vistas = this.vistasPorRef.get(request.ref);
+      if (vistas && !vistas.includes(view)) throw new Error(`${this.source} does not support inspect view: ${view}`);
+      const result = await this.call(this.options.inspectTool, { id: parsed.identity, view });
+      const payload = inspeccionSchema.parse(structuredOrJsonText(result, `${this.source} inspect`));
+      const bounded = truncateUtf8(payload.content, 16_000);
+      return { source: this.source, ref: request.ref, view, content: bounded.text,
+        metadata: metadataAcotada(payload.metadata), truncated: bounded.truncated };
+    }
+    if (profile === "docs") {
       if (view !== "content") throw new Error(`Docs does not support inspect view: ${view}`);
       const retained = this.docsCache.get(request.ref);
       if (!retained) throw new Error("Docs reference is no longer materialized; repeat context.find and inspect the new ref");
