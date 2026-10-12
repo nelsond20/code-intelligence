@@ -6,6 +6,10 @@ export function codeRef(repo: string, sourcePath: string, start: number, end: nu
   return `code://${encodeURIComponent(repo)}/${sourcePath.split("/").map(encodeURIComponent).join("/")}#${fragment}`;
 }
 export function externalRef(source: "docs", identity: string): string { return `${source}://item/${encodeURIComponent(identity)}`; }
+export function sourceRef(source: string, identity: string): string {
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(source) || !identity || identity.length > 2_000) throw new Error("Invalid source reference identity");
+  return `ci-source://${source}/v1/${encodeURIComponent(identity)}`;
+}
 export function vaultRef(identity: string): string {
   if (!/^[0-9a-z]+$/.test(identity)) throw new Error("Invalid Vault reference identity");
   return `v:${identity}`;
@@ -25,6 +29,14 @@ export function parseContextRef(value: string): { source: ContextSource; repo?: 
   if (shortVault) return { source: "vault", identity: shortVault[1] };
   let url: URL;
   try { url = new URL(value); } catch { throw new Error("Invalid context reference"); }
+  if (url.protocol === "ci-source:") {
+    if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(url.hostname) || !url.pathname.startsWith("/v1/") || url.search || url.hash) {
+      throw new Error("Invalid source reference");
+    }
+    const identity = decodeURIComponent(url.pathname.slice(4));
+    if (!identity || identity.length > 2_000) throw new Error("Invalid source reference identity");
+    return { source: url.hostname, identity };
+  }
   const source = url.protocol.slice(0, -1) as ContextSource;
   if (!(["code", "docs", "vault", "git"] as string[]).includes(source)) throw new Error("Unsupported context reference scheme");
   if (source === "code") {

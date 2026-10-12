@@ -28,7 +28,7 @@ test("four Qwen 0.24.7 skills are model-invocable and define the required transi
   assert.match(bodies[0]!, /Never use `memory\.note` for tool-call bookkeeping/);
   assert.match(bodies[3]!, /Before ANY code mutation call Code Intelligence `plan\.current`/);
   assert.match(bodies[3]!, /plan\.complete_current[\s\S]*code-review-and-quality/);
-  assert.match(bodies[3]!, /cumulative plan delta[\s\S]*external review receipt/);
+  assert.match(bodies[3]!, /cumulative `code-review-and-quality` review is optional[\s\S]*review_status: unverified/);
 });
 
 test("Qwen settings example has unique keys and keeps model skills and MCP plan visible", async () => {
@@ -104,7 +104,7 @@ test("persisted evidence, spec, plan and review state derive stage; plan guard b
     plan.steps[plan.current_step]!.status = "current";
     plan.status = "final_review";
     await runtime.plans.storage.write("planning", plan);
-    assert.equal((await stage()).required_skill, "code-review-and-quality");
+    assert.equal((await stage()).required_skill, null);
     assert.equal(((await runtime.plan({ action: "current" })) as any).stage, "final_review");
     await runtime.tasks.setSpec("planning", { summary: "Changed behavior", requirements: [{ id: "R1", statement: "The changed behavior is verified", kind: "behavior", priority: "must" }] });
     assert.equal((await stage()).stage, "operator_action_required");

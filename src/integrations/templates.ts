@@ -1,12 +1,12 @@
 export const managedAgentsBlock = `<!-- CODE_INTELLIGENCE_BEGIN -->
-## Local context broker, memory, and guarded plans
+## Local context broker, memory, and plans
 
 - **FIND:** Use \`context.find\` to discover relevant code, docs, or personal knowledge.
 - **INSPECT:** Use \`context.inspect\` for exact content, surroundings, references, or relations from a discovered ref.
 - Refs are opaque broker handles. Pass them exactly as returned by \`context.find\`; never decode, reconstruct, edit, or guess them. Ephemeral refs may require repeating \`context.find\` after restart or eviction.
 - **MEMORY:** Use \`memory\` as persistent work memory. Call \`memory current\` when resuming substantial work. Record durable observations, evidence, hypotheses, decisions, questions, blockers, and relevant context early. The confirmed spec belongs to memory.
-- **PLAN:** After setting the complete structured spec, create a small plan with title, objective, and optional write paths; call \`plan current\` before mutations. Work only the server-owned current step. Call \`plan complete_current\` to run configured checks or \`plan revise_current\` with a reason. After all steps, invoke \`code-review-and-quality\` for the cumulative change; the operator controls final completion.
-- The MCP workspace is configured by the host. Never pass or guess a workspace ID. Use \`scope\` only to restrict Code/Git discovery to a repository inside that workspace; Docs and Vault ignore it.
+- **PLAN:** After setting the complete structured spec, create a small plan with title, objective, and optional write paths; call \`plan current\` before mutations. Work on the server-owned current step. Call \`plan complete_current\` to run configured checks or \`plan revise_current\` with a reason. The operator controls final completion; external review is optional.
+- The MCP workspace is configured by the host. Never pass or guess a workspace ID. Use \`scope\` only to restrict Code/Git discovery to a repository inside that workspace; configured external sources do not receive repository scope by default.
 - For change review, use read-only Git or broker Git inspection to determine what changed, then \`context.find\`/\`context.inspect\` to determine impact. Prefer summary/file views over large diffs.
 - Context inspection may record inspected refs, files, symbols, and commits mechanically. Use \`memory\` notes for semantic findings, hypotheses, decisions, and conclusions.
 <!-- CODE_INTELLIGENCE_END -->`;

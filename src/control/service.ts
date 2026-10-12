@@ -338,9 +338,9 @@ export class MemoryControlService {
       const target = await this.tasks.storage.read(workspace, id);
       if (target.status === "completed") throw new Error("Memory is already completed");
       const existingPlan = await this.planStorage.read(workspace, id);
-      if (existingPlan && existingPlan.status !== "completed") throw new Error("PLAN_REVIEW_REQUIRED: Complete the plan and its final code review before completing this memory");
+      if (existingPlan && existingPlan.status !== "completed") throw new Error("PLAN_NOT_COMPLETE: Complete the plan before completing this memory");
+      if (existingPlan && !existingPlan.final_evidence) throw new Error("PLAN_EVIDENCE_REQUIRED: Finish the plan through its checks before completing this memory");
       if (existingPlan && (await this.plans.stateForMemory(workspace, id)).stale) throw new Error("PLAN_STALE: The completed plan is bound to an older specification");
-      if (existingPlan && !(await this.plans.inspect(workspace, id)).receipt_current) throw new Error("PLAN_REVIEW_REQUIRED: The plan review receipt is missing or stale");
       if (decision === "suspend") throw new Error("Completing memory requires abandoning an open plan");
       const previousPlan = await this.planStorage.read(workspace, id);
       let stateWriteAttempted = false;

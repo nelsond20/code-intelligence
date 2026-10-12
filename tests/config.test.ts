@@ -178,3 +178,18 @@ test("Local Docs accepts an explicitly configured inspect tool for backward-comp
   const config = defaultConfig(); config.local_docs.inspect_tool = "legacy.read";
   assert.equal(parseConfigToml(serializeConfigToml(config)).local_docs.inspect_tool, "legacy.read");
 });
+
+test("version 2 sources round-trip while version 1 remains readable", () => {
+  const config = defaultConfig();
+  config.schema_version = 2;
+  config.sources = [{ id: "manuales-equipo", enabled: true, transport: "stdio", command: "manuales-ci-adapter",
+    args: ["--local"], timeout_ms: 7_000, search_tool: "search", inspect_tool: "inspect" }];
+  const parsed = parseConfigToml(serializeConfigToml(config));
+  assert.deepEqual(parsed.sources, config.sources);
+  assert.equal(parseConfigToml("schema_version = 1\n[local_docs]\nenabled = true\n").local_docs.enabled, true);
+  assert.throws(() => parseConfigToml(serializeConfigToml(config).replace('id = "manuales-equipo"', 'id = "code"')), /reserved/);
+  assert.throws(() => parseConfigToml(`${serializeConfigToml(config)}\n[[sources]]\nid = "manuales-equipo"\ncommand = "other"\n`), /duplicate/);
+  assert.throws(() => parseConfigToml(`${serializeConfigToml(config)}\n[unexpected]\nvalue = "lost"\n`), /Unknown configuration field/);
+  assert.throws(() => parseConfigToml(serializeConfigToml(config).replace('transport = "stdio"\ncommand = "manuales-ci-adapter"',
+    'transport = "http"\nurl = "https://example.com/mcp"')), /not loopback/);
+});

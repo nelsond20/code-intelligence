@@ -4,7 +4,7 @@ La documentación formal de la versión 0.3.0 empieza en
 [docs/README.md](docs/README.md). Incluye guía completa, referencia MCP,
 configuración, operación, limitaciones, benchmark y handoff.
 
-Code Intelligence is a local **Context Broker + Persistent Work Memory + Guarded Plan** for OpenCode and local models. It keeps durable work context across sessions and compactions, retrieves small relevant slices from multiple repositories, and presents exactly four MCP tools:
+Code Intelligence is a local **Context Broker + Persistent Work Memory + Plan** for MCP clients including OpenCode, Codex, Claude and Qwen. It keeps durable work context across sessions, retrieves small relevant slices from multiple repositories and insertable sources, and presents exactly four MCP tools:
 
 - `context.find` discovers code, local documentation, vault knowledge, and Git history.
 - `context.inspect` deepens an opaque broker reference with bounded content, surroundings, relationships, commit summaries, diffs, or blame.
@@ -16,14 +16,13 @@ The default configuration sends no source, prompts, queries, embeddings, analyti
 ## Architecture
 
 ```text
-OpenCode / Ornith
+Any compatible MCP client
   └─ context.find | context.inspect | memory | plan
        └─ local Context Broker
             ├─ code: lexical + local semantic + Graphify/Serena fallbacks
-            ├─ docs: existing local-docs MCP (optional)
-            ├─ vault: existing vault-retrieval MCP (optional)
+            ├─ configured MCP sources (including legacy Docs/Vault)
             ├─ git: structured read-only history/diff/blame
-            └─ persistent memory, plan state, and OpenCode PlanGuard
+            └─ persistent memory and spec-bound plan state
 ```
 
 Repositories stay in their original locations. Semantic indexes contain vectors and location/hash metadata, not a second source-code copy. Task files live outside repositories under `~/.local/share/code-intelligence` by default.
@@ -107,6 +106,10 @@ If the configured embedding provider is unavailable, `context.find` degrades to 
 
 ## Optional local sources
 
+Configuration v2 accepts `[[sources]]` entries with stable IDs and a versioned
+MCP search/inspect contract. See [source plugins](docs/product/SOURCE_PLUGINS.md).
+Version 1 Docs and Vault settings remain supported.
+
 Existing `local-docs` and `vault-retrieval` services are internal broker adapters, not reimplementations or public tools. Their direct OpenCode configuration is never deleted or disabled by this installer. Existing Streamable HTTP MCP servers can be configured as follows:
 
 ```toml
@@ -156,7 +159,7 @@ For Ornith, use context `90112` and output `8192`. This project does not change 
 
 ## Typical workflow
 
-For substantial work, use `code-intelligence ui` to create and select the active memory. The agent can call `memory(action="current")`, record durable meaning with `memory(action="note")`, resolve records by server ID, and declare the complete desired structured specification with `memory(action="spec_set")`. For guarded work, create a coverage-checked plan, call `plan(action="current")`, work only in the current write set, verify it, and request `plan(action="complete_current")`. Use `plan(action="revise_current")` for the current step. The localhost UI owns suspend/reactivate/abandon and final completion requires a cumulative `code-review-and-quality` receipt; Qwen 0.24.7 currently exposes no verifiable review result, so the gate remains hard.
+For substantial work, use `code-intelligence ui` to create and select the active memory. The agent can call `memory(action="current")`, record durable meaning with `memory(action="note")`, resolve records by server ID, and declare the complete desired structured specification with `memory(action="spec_set")`. Create a spec-bound plan, call `plan(action="current")` before each step, verify the declared changes, and request `plan(action="complete_current")`. Use `plan(action="revise_current")` for the current step. The localhost UI owns suspend/reactivate/abandon and final completion. External review is optional; without a trusted receipt the plan records `review_status: unverified`. See [MCP client setup](docs/product/PORTABLE_CLIENTS.md).
 
 The UI also provides Archive, Restore, and Delete for memories, notes, specifications, and plans. Archive hides an item in the default UI view and can be reversed; deleting removes its stored data. The [user guide](docs/product/USER_GUIDE.md) explains the dependencies and restore views.
 

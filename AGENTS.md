@@ -9,9 +9,9 @@ Follow the user's explicit request, then the live tool declarations and response
 - Prefer one valid call over exploratory invalid calls. Use the declared field names, casing, enums, and payload shape. Do not add undeclared fields or wrappers.
 - Never invent refs, record IDs, requirement IDs, step IDs, or verification evidence. Reuse an identifier only when the current response supplies it for the next call.
 - If validation fails, follow the exact error and `next_action`; change only the invalid part. Do not repeat the same rejected shape.
-- Names such as `context.find`, `memory.current`, and `plan.create` describe Code Intelligence operations. They are not necessarily Qwen tool names. Use the exact tool name declared in the current session.
+- Names such as `context.find`, `memory.current`, and `plan.create` describe Code Intelligence operations. They are not necessarily the client's tool names. Use the exact tool name declared in the current session.
 - When `mcp__code-intelligence__memory` or `mcp__code-intelligence__plan` is declared directly, invoke that function directly with its action payload. For example, call `mcp__code-intelligence__plan` with `{"action":"current"}` for `plan.current`.
-- Never send a bare `plan` or `memory` name to `tool_call`. That bridge accepts only registered deferred tool names. A ToolSearch miss does not prove that a directly declared tool is absent. Use ToolSearch only when the required tool is actually deferred; if it is still absent, ask the operator to inspect Qwen's `/tools` or `/mcp` listing.
+- In clients with a deferred tool bridge, send only registered tool names. A tool search miss does not prove a directly declared tool is absent. Follow that client's live tool listing.
 
 ## Explore and read
 
@@ -35,14 +35,14 @@ For a focused file question, locate the relevant symbol or text and read the rel
 
 ## Code Intelligence workflow
 
-The human operator selects the active memory in the local control plane. For work tied to that memory, call `mcp__code-intelligence__memory` directly with `{"action":"current"}`. Follow the server's `stage`, `required_skill`, and `next_action`; load the matching stage skill when available. If a required skill is blocked or missing, report that blocker instead of claiming it ran. The server owns stage transitions and the current plan step.
+The human operator selects the active memory in the local control plane. For work tied to that memory, call the available Code Intelligence memory tool with `{"action":"current"}`. Follow the server's `stage` and `next_action`; load the suggested `required_skill` when available. A missing skill does not block the portable MCP workflow. The server owns stage transitions and the current plan step.
 
-During investigation, use `context.find` and `context.inspect` through their currently declared Qwen tool names. Save only durable findings or questions with `memory.note`; use inspected refs as evidence and server-issued record IDs for `memory.resolve`. When the server reaches specification, set the complete desired structured spec with `memory.spec_set`.
+During investigation, use `context.find` and `context.inspect` through their currently declared tool names. Save only durable findings or questions with `memory.note`; use inspected refs as evidence and server-issued record IDs for `memory.resolve`. When the server reaches specification, set the complete desired structured spec with `memory.spec_set`.
 
-During planning, call the direct `mcp__code-intelligence__plan` tool with `action: "create"` and a schema-valid `steps` array derived from the active spec. Then call the same tool with `{"action":"current"}` and confirm the server-selected step. Do not use Qwen native Plan Mode, TodoWrite, a chat-only plan, ToolSearch for an already declared tool, or `tool_call` with `name: "plan"`.
+During planning, call the available Code Intelligence plan tool with `action: "create"` and a schema-valid `steps` array derived from the active spec. Then call the same tool with `{"action":"current"}` and confirm the server-selected step. A client's native planning feature does not create this persistent plan.
 
-Before any code mutation, call the direct plan tool with `{"action":"current"}`. Modify only paths permitted by a valid, non-stale current implementation step. When ready, call it with `{"action":"complete_current"}`; the server runs its configured checks and decides whether to advance. If the current step needs redesign, use `revise_current` with a reason and replacement step. Do not invent verification results or advance steps yourself.
+Before code mutation in an active plan, call the plan tool with `{"action":"current"}`. Follow the current step and declared paths; a client without guard hooks does not mechanically enforce them. When ready, call it with `{"action":"complete_current"}`; the server checks declared changes and runs configured checks. If the step needs redesign, use `revise_current` with a reason and replacement step. Do not invent verification results or advance steps yourself.
 
-After each implementation step and for the cumulative final review, invoke the required `code-review-and-quality` skill if available. Resolve blocking findings and repeat affected verification and review after changes. A chat claim or skill invocation is not a trusted review receipt; report `CODE_REVIEW_REQUIRED` if the server cannot complete final review.
+Review remains useful after implementation steps and across the final delta when a review skill is available. A chat claim or skill invocation is not a trusted review receipt. The operator may finish a checked plan without a receipt; its final evidence records `review_status: unverified`.
 
 Memory and plan lifecycle controls belong to the human control plane. Do not send workspace, memory, plan, or spec revision IDs in MCP requests unless the live schema explicitly requires a field.

@@ -33,7 +33,7 @@ const guidance: Record<WorkflowStage, StageGuidance> = {
   specification: { stage: "specification", required_skill: "code-intelligence-specification", next_action: "Set the complete structured specification with memory.spec_set." },
   planning: { stage: "planning", required_skill: "code-intelligence-planning", next_action: "Create the persistent Code Intelligence plan with plan.create, then confirm plan.current." },
   implementation: { stage: "implementation", required_skill: "code-intelligence-implementation", next_action: "Load plan.current and work only the server-selected current step." },
-  final_review: { stage: "final_review", required_skill: "code-review-and-quality", next_action: "Review the cumulative plan delta and obtain a valid external review receipt before operator completion." },
+  final_review: { stage: "final_review", required_skill: null, next_action: "The operator may complete the plan; review is optional and unverified unless a trusted receipt exists." },
   completed: { stage: "completed", required_skill: null, next_action: "The plan is complete; the operator controls memory lifecycle." },
 };
 

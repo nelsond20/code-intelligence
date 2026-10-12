@@ -10,6 +10,7 @@ import { GraphifyAdapter } from "./graph/graphify-adapter.js";
 import { SerenaAdapter } from "./symbols/serena-adapter.js";
 import type { CodeIntelligenceConfig } from "./config/schema.js";
 import { LocalMcpAdapter } from "./broker/local-mcp-adapter.js";
+import { fuentesConfiguradas } from "./broker/service.js";
 import { findOpenCodeConfig, legacyDirectMcpNames } from "./integrations/opencode.js";
 import { TaskStorage } from "./task-state/storage.js";
 import { SemanticIndex } from "./search/semantic.js";
@@ -90,13 +91,12 @@ export async function doctor(fetcher: typeof fetch = fetch): Promise<DoctorCheck
   const serena = new SerenaAdapter(config.serena.command, config.serena.timeout_ms);
   checks.push({ name: "graphify", status: !config.graphify.enabled || await graphify.available() ? "ok" : "warning", detail: config.graphify.enabled ? "enabled" : "disabled (optional)" });
   checks.push({ name: "serena", status: !config.serena.enabled || await serena.available() ? "ok" : "warning", detail: config.serena.enabled ? "enabled" : "disabled (optional)" });
-  for (const [name, source, kind] of [["local-docs", config.local_docs, "docs"], ["vault-retrieval", config.vault, "vault"]] as const) {
-    if (!source.enabled) { checks.push({ name, status: "ok", detail: "disabled (optional)" }); continue; }
-    const adapter = new LocalMcpAdapter({ source: kind, transport: source.transport, command: source.command, url: source.url,
-      tokenFile: "token_file" in source ? source.token_file : undefined, networkPolicy: config.privacy.network_policy,
-      timeoutMs: source.timeout_ms, searchTool: source.search_tool, inspectTool: source.inspect_tool, fetcher });
+  for (const fuente of fuentesConfiguradas(config)) {
+    const name = fuente.name;
+    if (!fuente.enabled) { checks.push({ name, status: "ok", detail: "disabled (optional)" }); continue; }
+    const adapter = new LocalMcpAdapter({ ...fuente.options, fetcher });
     try { const result = await adapter.diagnose(); checks.push({ name, status: "ok", detail: `connected, tools discovered (${result.tools.length})` }); }
-    catch (error) { checks.push({ name, status: "warning", detail: `configured local source unavailable: ${(error as Error).message}` }); }
+    catch (error) { checks.push({ name, status: "warning", detail: `configured source unavailable: ${(error as Error).message}` }); }
   }
   const paths = appPaths();
   const openCodeConfigPath = await findOpenCodeConfig(paths.opencodeDir);

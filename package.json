@@ -1,7 +1,7 @@
 {
   "name": "code-intelligence",
   "version": "0.3.0",
-  "description": "Local code retrieval, persistent work memory, and guarded execution plans for OpenCode",
+  "description": "Local context retrieval, persistent work memory, and plans for MCP clients",
   "type": "module",
   "private": true,
   "bin": {

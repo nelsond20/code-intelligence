@@ -12,8 +12,24 @@ export const workspaceSchema = z.object({
   verification: z.array(z.enum(["lint", "typecheck", "build", "test"])).default([]),
 });
 
+export const sourceSchema = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/),
+  enabled: z.boolean().default(true),
+  transport: z.enum(["stdio", "http"]).default("stdio"),
+  command: z.string().min(1).optional(),
+  args: z.array(z.string()).max(32).default([]),
+  url: z.string().url().optional(),
+  token_file: z.string().min(1).optional(),
+  timeout_ms: z.number().int().min(100).max(600_000).default(7_000),
+  search_tool: z.string().min(1).default("search"),
+  inspect_tool: z.string().min(1).default("inspect"),
+}).strict().superRefine((fuente, context) => {
+  if (fuente.transport === "stdio" && !fuente.command) context.addIssue({ code: "custom", path: ["command"], message: "stdio source requires command" });
+  if (fuente.transport === "http" && !fuente.url) context.addIssue({ code: "custom", path: ["url"], message: "http source requires url" });
+});
+
 export const configSchema = z.object({
-  schema_version: z.literal(1).default(1),
+  schema_version: z.union([z.literal(1), z.literal(2)]).default(1),
   privacy: z.object({
     network_policy: z.enum(["loopback-only", "unrestricted"]).default("loopback-only"),
     store_raw_source: z.literal(false).default(false),
@@ -64,7 +80,18 @@ export const configSchema = z.object({
     read_max_lines: z.number().int().min(1).max(2000).default(400),
     output_max_bytes: z.number().int().min(1000).max(1_000_000).default(16_000),
   }).default({}),
+  sources: z.array(sourceSchema).max(32).default([]),
   workspaces: z.array(workspaceSchema).default([]),
+}).superRefine((config, context) => {
+  if (config.schema_version === 1 && config.sources.length) context.addIssue({ code: "custom", path: ["sources"], message: "sources require schema_version = 2" });
+  const ids = new Set<string>();
+  for (const [index, fuente] of config.sources.entries()) {
+    if (["code", "git"].includes(fuente.id) || fuente.id === "docs" && config.local_docs.enabled || fuente.id === "vault" && config.vault.enabled) {
+      context.addIssue({ code: "custom", path: ["sources", index, "id"], message: "source ID is reserved or already configured" });
+    }
+    if (ids.has(fuente.id)) context.addIssue({ code: "custom", path: ["sources", index, "id"], message: "duplicate source ID" });
+    ids.add(fuente.id);
+  }
 });
 
 export type CodeIntelligenceConfig = z.infer<typeof configSchema>;

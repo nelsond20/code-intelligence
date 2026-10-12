@@ -195,7 +195,7 @@ test("control transitions restore memory and plan after partial writes", async (
     await assertRestored();
     await failMemoryOnce(a.id, "paused", () => control.pause("planning", a.id, "suspend"));
     await assertRestored();
-    await assert.rejects(control.complete("planning", a.id, "abandon"), /PLAN_REVIEW_REQUIRED/);
+    await assert.rejects(control.complete("planning", a.id, "abandon"), /PLAN_NOT_COMPLETE/);
     await assertRestored();
   } finally { await env.cleanup(); }
 });
@@ -368,7 +368,7 @@ test("UI plan status route accepts every manual transition without fabricating r
       assert.equal(updated.final_evidence, undefined);
     }
     assert.equal((await control.plans.inspect("planning", memory.id)).receipt_current, false);
-    await assert.rejects(control.complete("planning", memory.id), /PLAN_REVIEW_REQUIRED/);
+    await assert.rejects(control.complete("planning", memory.id), /PLAN_EVIDENCE_REQUIRED/);
     await control.archivePlan("planning", memory.id, true);
     const restored = await route("active") as { status: string; archived_at?: string; steps: Array<{ status: string }> };
     assert.equal(restored.status, "active");

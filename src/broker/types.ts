@@ -1,4 +1,4 @@
-export type ContextSource = "code" | "docs" | "vault" | "git";
+export type ContextSource = string;
 export type InspectView = "content" | "surrounding" | "relations" | "references" | "summary" | "diff" | "file" | "impact" | "blame";
 
 export interface ContextReference {

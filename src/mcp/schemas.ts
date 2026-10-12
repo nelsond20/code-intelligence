@@ -3,7 +3,7 @@ import { confidenceSchema, desiredRequirementInput, memoryRecordStatusSchema, ta
 
 export const contextFindInput = z.object({
   query: z.string().min(1).max(2_000), scope: z.string().default("auto"),
-  sources: z.array(z.enum(["code", "docs", "vault", "git"])).max(4).optional(), limit: z.number().int().min(1).max(20).default(8),
+  sources: z.array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/)).max(32).optional(), limit: z.number().int().min(1).max(20).default(8),
 }).strict();
 export const contextInspectInput = z.object({
   ref: z.string().min(1).max(4_000), view: z.enum(["content", "surrounding", "relations", "references", "summary", "diff", "file", "impact", "blame"]).default("content"),

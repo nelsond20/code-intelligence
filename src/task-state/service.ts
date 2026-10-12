@@ -5,8 +5,7 @@ import { renderTaskContext, taskBootstrap } from "./context-renderer.js";
 import { slugify } from "../workspace/paths.js";
 import { planStateSchema } from "../plan/schemas.js";
 import { planBindingStale } from "../plan/binding.js";
-import { reviewReceiptCurrent, type ReviewReceiptTrust } from "../plan/review-state.js";
-import { WorkspaceRegistry } from "../workspace/registry.js";
+import { type ReviewReceiptTrust } from "../plan/review-state.js";
 import { projectTaskState } from "./projection.js";
 
 function uniquePush(values: string[], value: string, max = 50): string[] {
@@ -322,15 +321,13 @@ export class TaskService {
 
   private async assertMayLeave(workspaceId: string, memory: TaskState, completing = false): Promise<void> {
     const status = await this.planStatus(workspaceId, memory.id);
-    if (completing && status && status !== "completed") throw new Error(`PLAN_REVIEW_REQUIRED: Memory ${memory.id} cannot complete until its plan and final review are completed`);
+    if (completing && status && status !== "completed") throw new Error(`PLAN_NOT_COMPLETE: Memory ${memory.id} cannot complete until its plan is completed`);
     if (completing && status === "completed") {
       const raw = await this.storage.readPlan(workspaceId, memory.id);
       const plan = raw ? planStateSchema.parse(JSON.parse(raw)) : undefined;
+      if (plan && !plan.final_evidence) throw new Error(`PLAN_EVIDENCE_REQUIRED: Memory ${memory.id} requires completed plan checks`);
       if (plan && await planBindingStale(this.storage, workspaceId, plan)) {
         throw new Error(`PLAN_STALE: Memory ${memory.id} is bound to an older specification`);
-      }
-      if (plan && !(await reviewReceiptCurrent(workspaceId, plan, new WorkspaceRegistry(), this.reviewTrust))) {
-        throw new Error(`PLAN_REVIEW_REQUIRED: Memory ${memory.id} needs a current cumulative code-review-and-quality receipt`);
       }
     }
     if (status === "active" || status === "final_review") throw new Error(`Memory ${memory.id} has an ${status} plan; suspend, complete, or abandon the plan first`);

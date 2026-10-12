@@ -419,15 +419,15 @@ export class PlanService {
         steps, gaps: [
           ...(!steps.length ? ["No plan step covers this requirement"] : []),
           ...(stale ? ["Plan is bound to an older specification"] : []),
-          ...(!receiptCurrent ? [trustedReceipt ? "Review receipt is blocked or stale" : "Trusted review receipt is missing"] : []),
+          ...(!receiptCurrent && trustedReceipt ? ["Review receipt is blocked or stale"] : []),
         ],
-        review_status: receiptCurrent ? "approved" : trustedReceipt ? "blocked or stale" : "required",
+        review_status: receiptCurrent ? "approved" : trustedReceipt ? "blocked or stale" : "unverified",
         review_findings: trustedReceipt && plan.review_receipt && "findings" in plan.review_receipt
           ? plan.review_receipt.findings.filter((item) => !item.covers?.length || item.covers.includes(requirement.id)) : [],
       };
     });
-    return { plan, stale, review_gate: stale ? "plan_stale" : plan.status === "completed" ? receiptCurrent ? "satisfied" : "legacy_unverified" : plan.status === "final_review"
-      ? receiptCurrent ? "ready" : "code_review_required" : "not_ready", receipt_current: receiptCurrent,
+    return { plan, stale, review_gate: stale ? "plan_stale" : plan.status === "completed" ? receiptCurrent ? "satisfied" : "unverified" : plan.status === "final_review"
+      ? receiptCurrent ? "ready" : "optional" : "not_ready", receipt_current: receiptCurrent,
       unresolved_markers: plan.status === "final_review" ? await this.unresolvedMarkers(workspaceId, plan) : [], traceability };
   }
 
@@ -462,9 +462,9 @@ export class PlanService {
     const { plan, stale } = await this.state(workspaceId); if (!plan) return { active: false as const };
     if (plan.status === "completed" || plan.status === "abandoned") return { active: false as const, completed: plan.status === "completed", abandoned: plan.status === "abandoned", revision: plan.revision };
     if (plan.status === "final_review") return { active: false as const, status: "final_review" as const, stale, spec_revision: plan.spec_revision,
-      review_gate: stale ? "PLAN_STALE" : await this.reviewCurrent(workspaceId, plan) ? "ready" : "CODE_REVIEW_REQUIRED",
+      review_gate: stale ? "PLAN_STALE" : await this.reviewCurrent(workspaceId, plan) ? "ready" : "optional",
       completed_steps: plan.steps.filter((step) => step.status === "completed").length, total: plan.steps.length,
-      next_action: stale ? "Ask the operator to resolve the stale plan" : "Invoke code-review-and-quality on the cumulative plan delta; the operator finishes the plan after a clean review" };
+      next_action: stale ? "Ask the operator to resolve the stale plan" : "The operator may finish the plan; an external review is optional and recorded only when verified" };
     const step = plan.steps[plan.current_step]!;
     const multipleRepositories = (await this.registry.get(workspaceId)).repositories.length > 1;
     const checks = await this.configuredChecks(workspaceId, step);
@@ -494,22 +494,18 @@ export class PlanService {
       const { plan, stale } = await this.state(workspaceId); if (!plan || !["active", "final_review"].includes(plan.status)) throw new Error("No active plan");
       if (stale) return { advanced: false, message: "STEP NOT COMPLETE", missing: ["plan is stale because the confirmed spec changed"] };
       if (plan.status === "final_review") {
-        if (!allowFinalReview) throw new Error("CODE_REVIEW_REQUIRED: Final plan completion belongs to the operator after the cumulative review gate");
+        if (!allowFinalReview) throw new Error("OPERATOR_ACTION_REQUIRED: Final plan completion belongs to the operator");
         const gaps: string[] = []; const covered = new Set(plan.steps.flatMap((item) => item.covers));
         gaps.push(...(await this.unresolvedMarkers(workspaceId, plan)).map((item) => `${item} contains an unresolved implementation marker`));
-        if (!(await this.reviewCurrent(workspaceId, plan))) {
-          gaps.push("CODE_REVIEW_REQUIRED: a fresh, clean code-review-and-quality receipt is required for the cumulative plan code state");
-        }
         if (gaps.length) return { advanced: false, message: "FINAL REVIEW NOT COMPLETE", missing: gaps };
+        const reviewStatus = await this.reviewCurrent(workspaceId, plan) ? "verified" as const : "unverified" as const;
         plan.status = "completed"; plan.updated_at = new Date().toISOString();
         plan.final_evidence = { covered_requirements: [...covered], modified_paths: [...new Set(plan.steps.flatMap((step) => step.modified_paths.map((item) => `${item.repo}:${item.path}`)))],
-          verifications: plan.steps.flatMap((step) => step.verification.map(verificationCommand)), completed_at: plan.updated_at };
+          verifications: plan.steps.flatMap((step) => step.verification.map(verificationCommand)), review_status: reviewStatus, completed_at: plan.updated_at };
         await this.storage.write(workspaceId, plan); return { advanced: true, plan_completed: true, final_evidence: plan.final_evidence };
       }
       const step = plan.steps[plan.current_step]!; const missing: string[] = [];
       if (step.status !== "current") missing.push("current step is not active");
-      if (step.pending_shell || step.pending_mutation) missing.push("tool effects have not been verified by the guard");
-      for (const violation of step.violations) missing.push(`guard violation at ${violation.repo}:${violation.path}: ${violation.reason}`);
       let contentDeltaVerified = false;
       if (step.kind === "implementation") {
         const { current, changed } = await this.reconcileWrites(workspaceId, plan, step);

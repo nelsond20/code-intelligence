@@ -65,7 +65,7 @@ test("plan lifecycle, no-op mutation, mutating verification, and shell postcondi
     await writeFile(path.join(setup.repo, "src", "outside.ts"), "export const outside = 2;\n");
     const shell = await guard.afterShell("planning", "npm test", 0);
     assert.deepEqual(shell.violations, ["repo:src/outside.ts"]); assert.equal(shell.verified, false);
-    assert.match(((await setup.plans.complete("planning")) as { missing: string[] }).missing.join("\n"), /guard violation/);
+    assert.match(((await setup.plans.complete("planning")) as { missing: string[] }).missing.join("\n"), /no filesystem content delta/);
     await setup.plans.transition("planning", "suspended", "switch tasks");
     assert.equal((await guard.beforeMutation("planning", [allowed])).allowed, false);
     await setup.tasks.transition("planning", "paused");

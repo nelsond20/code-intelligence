@@ -480,7 +480,7 @@ test("MCP preflight and evidence flow are self-contained and reject misleading n
     response = await call("plan", { action: "create", steps: [{ ...baseStep, title: "Verify" }] });
     assert.equal(response.status, "ok"); assert.deepEqual(response.data.step.writes, []);
     await new PlanService().transition("planning", "abandoned", "Verification shape checked");
-    await assert.rejects(new TaskService().complete("planning", memoryId, "Preflight completed"), /PLAN_REVIEW_REQUIRED/);
+    await assert.rejects(new TaskService().complete("planning", memoryId, "Preflight completed"), /PLAN_NOT_COMPLETE/);
   } finally {
     await close();
     if (previous === undefined) delete process.env.CODE_INTELLIGENCE_WORKSPACE; else process.env.CODE_INTELLIGENCE_WORKSPACE = previous;
