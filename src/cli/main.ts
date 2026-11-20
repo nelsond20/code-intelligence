@@ -9,6 +9,9 @@ import { applyOpenCodeIntegration, planOpenCodeIntegration } from "../integratio
 import { IndexProgressRenderer } from "./progress.js";
 import { PlanService } from "../plan/service.js";
 import { PlanGuard } from "../plan/guard.js";
+import { atomicWrite, readTextIfExists } from "../shared/fs.js";
+import { appPaths } from "../workspace/paths.js";
+import path from "node:path";
 
 const args = process.argv.slice(2);
 const has = (flag: string) => args.includes(flag);
@@ -17,7 +20,7 @@ function options(name: string): string[] { return args.flatMap((value, index) =>
 function positional(start: number): string[] {
   const values: string[] = [];
   for (let i = start; i < args.length; i++) {
-    if (args[i]!.startsWith("--")) { if (!["--dry-run", "--yes", "--force", "--progress"].includes(args[i]!)) i++; continue; }
+    if (args[i]!.startsWith("--")) { if (!["--dry-run", "--yes", "--force", "--progress", "--changed"].includes(args[i]!)) i++; continue; }
     values.push(args[i]!);
   }
   return values;
@@ -35,6 +38,15 @@ async function run(): Promise<void> {
   const [command, subcommand] = args;
   const registry = new WorkspaceRegistry(); const tasks = new TaskService(); const plans = new PlanService(undefined, tasks, registry); const guard = new PlanGuard(plans, registry);
   if (command === "serve-mcp") return (await import("../mcp/server.js")).serveMcp();
+  if (command === "ui") {
+    const port = Number(option("--port") || 4317);
+    const url = await (await import("../control/server.js")).serveControlUi(port);
+    output(`Memory control plane: ${url}`); return;
+  }
+  if (command === "integration" && subcommand === "heartbeat") {
+    const workspace = workspaceFromArgs(); await atomicWrite(path.join(appPaths().dataDir, "guard-heartbeat.json"),
+      `${JSON.stringify({ version: 2, integration: "opencode", workspace, at: new Date().toISOString() })}\n`); return output({ recorded: true });
+  }
   if (command === "doctor") { const checks = await doctor(); checks.forEach((check) => output(`${check.status.toUpperCase().padEnd(7)} ${check.name}: ${check.detail}`)); if (checks.some((c) => c.status === "error")) process.exitCode = 1; return; }
   if (command === "workspace") {
     if (subcommand === "list") return output(await registry.list());
@@ -52,8 +64,15 @@ async function run(): Promise<void> {
     if (subcommand === "activate") return output(await tasks.activate(workspace, positional(2)[0] || ""));
     if (subcommand === "pause" || subcommand === "complete") return output(await tasks.transition(workspace, subcommand === "pause" ? "paused" : "completed", positional(2)[0]));
     if (subcommand === "context") {
-      const memory = await tasks.context(workspace, Number(option("--max-tokens") || 3000));
-      return output(memory === "No active memory." ? memory : `${memory}\n\n${await plans.context(workspace)}`);
+      const maxTokens = Number(option("--max-tokens") || 3000); const maxChars = Math.max(400, maxTokens * 4);
+      const planContext = await plans.context(workspace);
+      const reserved = Math.min(maxChars - 200, planContext.length + 180);
+      const memory = await tasks.context(workspace, Math.max(100, Math.floor((maxChars - reserved) / 4)));
+      if (memory === "No active memory." && planContext.endsWith("None.")) return output(memory);
+      const fixed = ["## RESUME CAPSULE", planContext, "## NEXT ACTION", "Call `plan(action=\"current\")` before the next mutation."].join("\n\n");
+      const available = Math.max(0, maxChars - fixed.length - 2); const memoryItems = memory.split("\n\n"); const included: string[] = [];
+      for (const item of memoryItems) { if ([...included, item].join("\n\n").length > available - 40) break; included.push(item); }
+      return output([fixed, included.join("\n\n"), included.length < memoryItems.length ? "… [memory items omitted]" : ""].filter(Boolean).join("\n\n"));
     }
   }
   if (command === "plan") {
@@ -69,16 +88,22 @@ async function run(): Promise<void> {
     if (subcommand === "guard-after") {
       const input = await stdinJson();
       if (input.kind === "verification") return output({ recorded: await guard.afterVerification(workspace, String(input.command || ""), Number(input.exit_code)) });
-      await guard.afterMutation(workspace); return output({ recorded: true });
+      if (input.kind === "shell") return output(await guard.afterShell(workspace, String(input.command || ""), Number(input.exit_code)));
+      const changed = await guard.afterMutation(workspace, Array.isArray(input.targets) ? input.targets.map(String) : []);
+      return output({ recorded: changed, content_changed: changed });
     }
   }
   if (command === "index") {
     const workspace = workspaceFromArgs(); const config = await loadConfig();
     if (!config.embeddings.enabled) throw new Error("Semantic indexing is disabled in config");
-    const repositories = await registry.forScope(workspace, option("--repo") || "all"); const index = new SemanticIndex(config);
+    const repositories = await registry.forScope(workspace, option("--repo") || "all"); const index = new SemanticIndex(config, undefined, fetch, workspace);
     const progress = has("--progress") ? new IndexProgressRenderer() : undefined;
-    const results = []; for (const repository of repositories) results.push({ repo: repository.id,
+    const dirtyFile = path.join(appPaths().dataDir, "index-dirty", `${workspace}.json`);
+    const dirty = has("--changed") ? JSON.parse(await readTextIfExists(dirtyFile) || "[]") as Array<{ repo: string; path: string }> : [];
+    const selected = has("--changed") && dirty.length ? repositories.filter((repository) => dirty.some((item) => item.repo === repository.id)) : repositories;
+    const results = []; for (const repository of selected) results.push({ repo: repository.id,
       ...(await index.index(repository, has("--force"), undefined, progress ? (event) => progress.render(repository.id, event) : undefined)) });
+    if (has("--changed")) await atomicWrite(dirtyFile, "[]\n");
     return output(results);
   }
   if (command === "install-opencode" || command === "uninstall-opencode") {
@@ -89,11 +114,12 @@ async function run(): Promise<void> {
   output(`Usage:
   code-intelligence doctor
   code-intelligence workspace list|add|remove|repo-add|repo-remove
-  code-intelligence index --workspace <id> [--repo <id>] [--force] [--progress]
+  code-intelligence index --workspace <id> [--repo <id>] [--force|--changed] [--progress]
   code-intelligence memory new|list|current|activate|pause|complete|context --workspace <id>
   code-intelligence plan current --workspace <id>
   code-intelligence install-opencode|uninstall-opencode [--dry-run] [--yes]
-  code-intelligence serve-mcp`);
+  code-intelligence serve-mcp
+  code-intelligence ui [--port 4317]`);
   if (command) process.exitCode = 1;
 }
 

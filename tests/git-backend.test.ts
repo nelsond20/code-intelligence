@@ -36,7 +36,7 @@ test("Git is an internal read-only bounded source with round-trip refs", async (
     await assert.rejects(backend.inspect({ ref: "git://repo/commit/not-a-hash", view: "summary" }), /Invalid commit hash/);
     await assert.rejects(backend.inspect({ ref: "git://missing/commit/abcdef1", view: "summary" }), /Unknown repository/);
     await assert.rejects(access(hookMarker), /ENOENT/, "read-only inspection must not execute repository hooks");
-    process.env.CODE_INTELLIGENCE_WORKSPACE = "history"; const runtime = new ToolRuntime(); await runtime.memory({ action: "new", title: "History review" });
+    process.env.CODE_INTELLIGENCE_WORKSPACE = "history"; const runtime = new ToolRuntime(); await runtime.tasks.create("history", "History review");
     await runtime.contextInspect({ ref: found[0]!.ref, view: "impact" });
     const state = await runtime.tasks.current("history"); assert.equal(state?.inspected_commits[0]?.repo, "repo"); assert.equal(state?.active_hypotheses.length, 0);
     const api = Object.getOwnPropertyNames(ReadonlyGit.prototype);

@@ -32,7 +32,7 @@ export class WorkspaceRegistry {
       used.add(repositoryId);
       repositories.push({ id: repositoryId, path: canonical });
     }
-    const workspace: Workspace = { id, name, repositories };
+    const workspace: Workspace = { id, name, repositories, verification: [] };
     config.workspaces.push(workspace);
     await saveConfig(config, this.configFile);
     await atomicWrite(path.join(this.dataRoot, id, "workspace.json"), `${JSON.stringify({ schema_version: 1, ...workspace }, null, 2)}\n`);

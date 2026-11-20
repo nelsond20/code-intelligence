@@ -1,5 +1,6 @@
 import type { Repository } from "../config/schema.js";
 import { isGloballyIgnored } from "../privacy/ignores.js";
+import { RepositoryAccessPolicy } from "../privacy/repository-access.js";
 import { truncateUtf8 } from "../shared/fs.js";
 import { runProcess } from "../shared/process.js";
 
@@ -42,12 +43,13 @@ export class ReadonlyGit {
       { args: ["log", `--max-count=${count}`, "--date=iso-strict", `--format=${format}`, `-S${clean}`, "--name-only"], reason: "changed text" },
     ];
     const found = new Map<string, GitCommitMatch>();
+    const policy = await RepositoryAccessPolicy.create(repository.path);
     for (const search of searches) {
       const output = await this.execute(repository, search.args, 40_000);
       for (const block of output.split(/^@@/m).filter(Boolean)) {
         const [header, ...fileLines] = block.trim().split(/\r?\n/); const [commit, date, subject] = (header || "").split("\x1f");
         if (!commit || !HASH.test(commit)) continue;
-        const files = fileLines.map((line) => line.trim()).filter((line) => line && !isGloballyIgnored(line)).slice(0, 30);
+        const files = fileLines.map((line) => line.trim()).filter((line) => line && policy.canRead(line)).slice(0, 30);
         const previous = found.get(commit);
         found.set(commit, { commit, date: date || "", subject: subject || "", files: [...new Set([...(previous?.files || []), ...files])],
           reason: previous ? `${previous.reason} + ${search.reason}` : search.reason });
@@ -60,9 +62,10 @@ export class ReadonlyGit {
     const hash = commitHash(commit);
     const output = await this.execute(repository, ["show", "--no-ext-diff", "--no-textconv", "--format=%H%x1f%an%x1f%ad%x1f%s", "--date=iso-strict", "--numstat", "--no-renames", hash], 40_000);
     const [header, ...rows] = output.trim().split(/\r?\n/); const [full, author, date, subject] = (header || "").split("\x1f");
+    const policy = await RepositoryAccessPolicy.create(repository.path);
     const files = rows.map((row) => {
       const [added, deleted, ...rest] = row.split("\t"); const file = rest.join("\t");
-      return file && !isGloballyIgnored(file) ? { path: file, insertions: added === "-" ? undefined : Number(added), deletions: deleted === "-" ? undefined : Number(deleted) } : undefined;
+      return file && policy.canRead(file) ? { path: file, insertions: added === "-" ? undefined : Number(added), deletions: deleted === "-" ? undefined : Number(deleted) } : undefined;
     }).filter((item): item is NonNullable<typeof item> => item !== undefined).slice(0, 100);
     const totals = files.reduce((sum, file) => ({ insertions: sum.insertions + (file.insertions || 0), deletions: sum.deletions + (file.deletions || 0) }), { insertions: 0, deletions: 0 });
     const changedSymbols = await this.changedSymbols(repository, hash);
@@ -70,14 +73,17 @@ export class ReadonlyGit {
   }
 
   async commitDiff(repository: Repository, commit: string, file?: string) {
-    const args = ["show", "--no-ext-diff", "--no-textconv", "--format=", "--patch", "--unified=20", commitHash(commit)];
-    if (file) args.push("--", repositoryPath(file));
-    const raw = await this.execute(repository, args, this.maxBytes * 2); const bounded = truncateUtf8(raw, this.maxBytes);
+    const hash = commitHash(commit); const policy = await RepositoryAccessPolicy.create(repository.path);
+    const files = file ? [policy.assertReadable(repositoryPath(file))] : (await this.commitSummary(repository, hash)).files.map((item) => item.path);
+    const patches: string[] = [];
+    for (const allowed of files) patches.push(await this.execute(repository,
+      ["show", "--no-ext-diff", "--no-textconv", "--format=", "--patch", "--unified=20", hash, "--", allowed], this.maxBytes * 2));
+    const raw = patches.join("\n"); const bounded = truncateUtf8(raw, this.maxBytes);
     return { repo: repository.id, commit, file, diff: bounded.text, truncated: bounded.truncated };
   }
 
   async blame(repository: Repository, file: string, commit: string, start = 1, end = 200) {
-    const path = repositoryPath(file); const from = Math.max(1, start); const to = Math.min(Math.max(from, end), from + 399);
+    const path = (await RepositoryAccessPolicy.create(repository.path)).assertReadable(repositoryPath(file)); const from = Math.max(1, start); const to = Math.min(Math.max(from, end), from + 399);
     const raw = await this.execute(repository, ["blame", "--porcelain", `-L${from},${to}`, commitHash(commit), "--", path]);
     const bounded = truncateUtf8(raw, this.maxBytes);
     return { repo: repository.id, commit, file: path, start_line: from, end_line: to, blame: bounded.text, truncated: bounded.truncated };

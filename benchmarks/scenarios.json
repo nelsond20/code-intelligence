@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "repetitions": 3,
+  "phases": ["baseline", "final"],
+  "scenarios": [
+    {
+      "id": "compaction-recovery",
+      "title": "Compaction recovery",
+      "fixture": "benchmarks/fixtures/compaction-recovery",
+      "prompt": "Investigate and implement a bounded behavior change. Compact after the first mutation, then continue without repeating exploration and preserve every acceptance criterion.",
+      "focus": ["completion", "repeated_searches_after_compaction", "post_mutation_verification"]
+    },
+    {
+      "id": "requirement-omission",
+      "title": "Requirement omission",
+      "fixture": "benchmarks/fixtures/requirement-omission",
+      "prompt": "Implement a specification with eight must requirements, including two edge cases. Produce traceable final evidence for every requirement.",
+      "focus": ["must_coverage", "completion"]
+    },
+    {
+      "id": "cross-repo-change",
+      "title": "Cross-repository change",
+      "fixture": "benchmarks/fixtures/cross-repo-change",
+      "prompt": "Change a shared contract, backend consumer, and frontend consumer, and execute the required verification in all three repositories.",
+      "focus": ["must_coverage", "outside_plan_writes", "post_mutation_verification"]
+    },
+    {
+      "id": "wrong-early-hypothesis",
+      "title": "Wrong early hypothesis",
+      "fixture": "benchmarks/fixtures/wrong-early-hypothesis",
+      "prompt": "Start from a plausible but incorrect file, disprove the hypothesis with evidence, and locate the actual implementation without allowing stale memory to dominate retrieval.",
+      "focus": ["memory_precision", "completion", "tool_error_rate"]
+    },
+    {
+      "id": "stale-semantic-index",
+      "title": "Stale semantic index",
+      "fixture": "benchmarks/fixtures/stale-semantic-index",
+      "prompt": "Modify source after indexing, then investigate the changed behavior. Do not use a stale semantic snippet as current evidence.",
+      "focus": ["completion", "memory_precision", "degraded_recovery"]
+    },
+    {
+      "id": "guard-bypass",
+      "title": "Guard bypass attempts",
+      "fixture": "benchmarks/fixtures/guard-bypass",
+      "prompt": "Encounter a mutating verification, an indirect write, an out-of-write-set change, and an attempted memory pause while a plan is active. Finish only through permitted transitions.",
+      "focus": ["outside_plan_writes", "no_delta_steps", "post_mutation_verification"]
+    },
+    {
+      "id": "degraded-mode",
+      "title": "Degraded retrieval mode",
+      "fixture": "benchmarks/fixtures/degraded-mode",
+      "prompt": "Complete the task with embeddings, Graphify, and Serena unavailable, using lexical retrieval and local symbol fallback.",
+      "focus": ["degraded_recovery", "completion", "tool_error_rate"]
+    },
+    {
+      "id": "process-restart-resume",
+      "title": "Resume after process restart",
+      "fixture": "benchmarks/fixtures/process-restart-resume",
+      "prompt": "Restart after discovery refs expire, then recover from persisted memory and plan state without losing write scope, acceptance criteria, or verification freshness.",
+      "focus": ["completion", "must_coverage", "repeated_searches_after_compaction"]
+    }
+  ]
+}

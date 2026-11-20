@@ -118,6 +118,15 @@ const shellCommand = (event: any): string => typeof event.input?.command === 'st
 const exitCode = (event: any): unknown => event.result?.metadata?.exitCode ?? event.result?.metadata?.exit_code ?? event.result?.metadata?.exitStatus?.exitCode ??
   (event.result?.output?.ok === true ? 0 : event.result?.output?.ok === false ? 1 : undefined);
 
+function recordHeartbeat(directory: string): void {
+  try {
+    const heartbeat = spawn('code-intelligence', ['integration', 'heartbeat', '--workspace', 'planning'], {
+      cwd: directory, shell: false, stdio: 'ignore', env: { ...process.env, NO_COLOR: '1' },
+    });
+    heartbeat.unref();
+  } catch { /* doctor will report a degraded guard */ }
+}
+
 export default {
   id: 'code-intelligence',
 
@@ -143,8 +152,10 @@ export default {
       registrations.push(await ctx.tool.hook('execute.before', async (event: any) => {
         if (['edit', 'write', 'patch'].includes(event.tool)) {
           await runGuard(ctx.location.directory, 'guard-before', { kind: 'mutation', targets: mutationTargets(event) });
+          recordHeartbeat(ctx.location.directory);
         } else if (event.tool === 'execute') {
           await runGuard(ctx.location.directory, 'guard-before', { kind: 'shell', command: shellCommand(event) });
+          recordHeartbeat(ctx.location.directory);
         }
       }));
       registrations.push(await ctx.tool.hook('execute.after', async (event: any) => {
@@ -152,7 +163,7 @@ export default {
         if (['edit', 'write', 'patch'].includes(event.tool)) {
           await runGuard(ctx.location.directory, 'guard-after', { kind: 'mutation', targets: mutationTargets(event) });
         } else if (event.tool === 'execute' && Number.isInteger(exitCode(event))) {
-          await runGuard(ctx.location.directory, 'guard-after', { kind: 'verification', command: shellCommand(event), exit_code: exitCode(event) });
+          await runGuard(ctx.location.directory, 'guard-after', { kind: 'shell', command: shellCommand(event), exit_code: exitCode(event) });
         }
       }));
 

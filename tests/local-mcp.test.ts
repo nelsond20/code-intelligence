@@ -19,6 +19,8 @@ interface MockMcpOptions {
   leakTokenInResult?: boolean;
   vaultSearchResult?: unknown;
   vaultReadNoteResult?: unknown;
+  normalizedSearchResult?: unknown;
+  normalizedInspectResult?: unknown;
   retrievalDelayMs?: number;
 }
 
@@ -56,6 +58,13 @@ function mockMcp(options: MockMcpOptions) {
           commit: "035aee01089b9f9d4b5b6af66a74002e07723fba",
         }] }) }] });
       }
+      if (params.name === "ci.search") return response({ content: [], structuredContent: options.normalizedSearchResult ?? {
+        schema_version: 1, results: [{ id: "guide/auth", title: "Auth guide", snippet: "Local guidance", score: 0.8,
+          metadata: { team: "core" }, views: ["content"] }],
+      } });
+      if (params.name === "ci.inspect") return response({ content: [], structuredContent: options.normalizedInspectResult ?? {
+        schema_version: 1, content: `inspected ${String(params.arguments.id)}`, metadata: { team: "core" },
+      } });
       if (params.name === "search") {
         const secret = options.leakTokenInResult ? options.token || "" : "";
         const payload = options.vaultSearchResult ?? { hits: [{ path: `guide/auth${secret}`, score: 0.9 }] };
@@ -78,6 +87,34 @@ function adapter(source: "docs" | "vault", fetcher: typeof fetch, overrides: Par
     networkPolicy: "loopback-only", searchTool: source === "docs" ? "docs.search" : "search",
     inspectTool: source === "vault" ? "read_note" : undefined, fetcher, ...overrides });
 }
+
+test("configured source uses normalized MCP contract and durable opaque refs", async () => {
+  const server = mockMcp({ tools: ["ci.search", "ci.inspect"] });
+  const options: LocalAdapterConfig = { source: "manuales-equipo", profile: "normalized", transport: "http", command: "",
+    url: "http://127.0.0.1:8123/mcp", networkPolicy: "loopback-only", searchTool: "ci.search",
+    inspectTool: "ci.inspect", fetcher: server.fetcher };
+  const broker = new ContextBroker([new LocalMcpAdapter(options)]);
+  const found = await broker.find({ query: "auth", sources: ["manuales-equipo"] });
+  assert.equal(found.results[0]?.source, "manuales-equipo");
+  assert.equal(found.results[0]?.ref, "ci-source://manuales-equipo/v1/guide%2Fauth");
+  await assert.rejects(broker.inspect({ ref: found.results[0]!.ref, view: "summary" }), /does not support inspect view/);
+  const restarted = new ContextBroker([new LocalMcpAdapter(options)]);
+  assert.equal((await restarted.inspect({ ref: found.results[0]!.ref }) as { content: string }).content, "inspected guide/auth");
+  assert.deepEqual(server.calls.at(-1)?.arguments, { id: "guide/auth", view: "content" });
+  await assert.rejects(broker.find({ query: "auth", sources: ["unknown-source"] }), /Unknown context source.*manuales-equipo/);
+});
+
+test("malformed inserted source degrades without losing other results", async () => {
+  const server = mockMcp({ tools: ["ci.search", "ci.inspect"], normalizedSearchResult: { schema_version: 1, results: [{ id: "bad" }] } });
+  const inserted = new LocalMcpAdapter({ source: "manuales-equipo", profile: "normalized", transport: "http", command: "",
+    url: "http://127.0.0.1:8123/mcp", networkPolicy: "loopback-only", searchTool: "ci.search",
+    inspectTool: "ci.inspect", fetcher: server.fetcher });
+  const existing: ContextBackend = { source: "code", async find() { return [{ ref: "code://repo/file.ts#L=1-1", source: "code", title: "file",
+    snippet: "result", score: 1 }]; }, async inspect() { return {}; } };
+  const result = await new ContextBroker([existing, inserted]).find({ query: "auth", sources: ["code", "manuales-equipo"] });
+  assert.equal(result.results.length, 1);
+  assert.match(result.unavailable_sources.join("\n"), /manuales-equipo/);
+});
 
 test("Local Docs discovers only docs.search and retains full results behind compact refs", async () => {
   const server = mockMcp({ tools: ["docs.search", "docs.health", "docs.sources"] });

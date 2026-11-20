@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 
@@ -14,6 +14,30 @@ export async function readTextIfExists(file: string): Promise<string | undefined
   try { return await readFile(file, "utf8"); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
+  }
+}
+
+export async function purgeDirectory(directory: string): Promise<void> {
+  try { if (!(await lstat(directory)).isDirectory()) throw new Error(`Refusing to purge a non-directory: ${directory}`); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  let entries;
+  try { entries = await readdir(directory, { withFileTypes: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  for (const entry of entries) {
+    const target = path.join(directory, entry.name);
+    if (entry.isDirectory() && !entry.isSymbolicLink()) await purgeDirectory(target);
+    else await rm(target, { force: true });
+  }
+  try { await rmdir(directory); }
+  catch (error) {
+    if (!["EPERM", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code || "")) throw error;
+    const hasContent = async (folder: string): Promise<boolean> => {
+      for (const entry of await readdir(folder, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.isSymbolicLink() || await hasContent(path.join(folder, entry.name))) return true;
+      }
+      return false;
+    };
+    if (await hasContent(directory)) throw error;
   }
 }
 
